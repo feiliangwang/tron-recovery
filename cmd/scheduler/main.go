@@ -24,12 +24,14 @@ var staticFS embed.FS
 var (
 	dataDir   = flag.String("data", "./data", "数据目录")
 	port      = flag.Int("port", 8080, "HTTP服务端口")
+	bloomFile = flag.String("bloom", "", "Bloom过滤器文件（gob格式，全局）")
 )
 
 // Server 服务器
 type Server struct {
 	taskManager *scheduler.TaskManager
 	compute     compute.SeedComputer
+	bloomFilter *bloom.Filter // 全局Bloom过滤器
 
 	activeJobs   map[string]*JobRunner
 	activeJobsMu sync.RWMutex
@@ -44,7 +46,6 @@ type Server struct {
 // JobRunner 任务运行器
 type JobRunner struct {
 	Job       *scheduler.Job
-	Bloom     *bloom.Filter
 	StopCh    chan struct{}
 	Running   bool
 	TaskQueue chan *protocol.Task
@@ -74,10 +75,22 @@ func main() {
 		log.Fatalf("创建任务管理器失败: %v", err)
 	}
 
+	// 加载Bloom过滤器（全局）
+	var bf *bloom.Filter
+	if *bloomFile != "" {
+		log.Printf("加载Bloom过滤器: %s", *bloomFile)
+		bf, err = bloom.LoadFromFile(*bloomFile)
+		if err != nil {
+			log.Fatalf("加载Bloom过滤器失败: %v", err)
+		}
+		log.Println("Bloom过滤器加载完成")
+	}
+
 	// 创建服务器
 	server := &Server{
 		taskManager: tm,
 		compute:     compute.NewCPUComputer(8),
+		bloomFilter: bf,
 		activeJobs:  make(map[string]*JobRunner),
 		workers:     make(map[string]*WorkerInfo),
 	}
@@ -97,6 +110,7 @@ func main() {
 	http.HandleFunc("/api/matches", server.handleMatches)
 	http.HandleFunc("/api/workers", server.handleWorkers)
 	http.HandleFunc("/api/stats", server.handleStats)
+	http.HandleFunc("/api/bloom", server.handleBloomInfo)
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("服务器启动: http://localhost%s", addr)
@@ -110,7 +124,6 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 从嵌入的文件系统读取
 	data, err := staticFS.ReadFile("static/index.html")
 	if err != nil {
 		http.Error(w, "index.html not found", 500)
@@ -125,16 +138,18 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		jobs := s.taskManager.ListJobs()
-		json.NewEncoder(w).Encode(map[string]interface{}{"jobs": jobs})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jobs":         jobs,
+			"bloom_loaded": s.bloomFilter != nil,
+		})
 		return
 	}
 
 	if r.Method == "POST" {
 		var req struct {
-			Name       string `json:"name"`
-			Mnemonic   string `json:"mnemonic"`
-			BatchSize  int    `json:"batch_size"`
-			BloomFile  string `json:"bloom_file"`
+			Name      string `json:"name"`
+			Mnemonic  string `json:"mnemonic"`
+			BatchSize int    `json:"batch_size"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -147,35 +162,11 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		}
 
 		job := s.taskManager.CreateJob(req.Name, req.Mnemonic, req.BatchSize)
-
-		// 如果有bloom文件，加载它
-		if req.BloomFile != "" {
-			go s.loadBloomAndStart(job.ID, req.BloomFile)
-		}
-
 		json.NewEncoder(w).Encode(job)
 		return
 	}
 
 	http.Error(w, "Method not allowed", 405)
-}
-
-// loadBloomAndStart 加载bloom并启动任务
-func (s *Server) loadBloomAndStart(jobID, bloomFile string) {
-	var bf *bloom.Filter
-	if bloomFile != "" {
-		var err error
-		bf, err = bloom.LoadFromFile(bloomFile)
-		if err != nil {
-			log.Printf("加载Bloom过滤器失败: %v", err)
-		}
-	}
-
-	s.activeJobsMu.Lock()
-	if runner, exists := s.activeJobs[jobID]; exists {
-		runner.Bloom = bf
-	}
-	s.activeJobsMu.Unlock()
 }
 
 // handleJobAction 任务操作
@@ -241,7 +232,6 @@ func (s *Server) startJob(jobID string) {
 		return
 	}
 
-	// 创建运行器
 	runner := &JobRunner{
 		Job:       job,
 		StopCh:    make(chan struct{}),
@@ -249,11 +239,7 @@ func (s *Server) startJob(jobID string) {
 	}
 
 	s.activeJobs[jobID] = runner
-
-	// 更新状态
 	s.taskManager.StartJob(jobID)
-
-	// 启动枚举
 	go s.runEnumerator(runner)
 }
 
@@ -307,7 +293,6 @@ func (s *Server) runEnumerator(runner *JobRunner) {
 		}
 
 		if !runner.Running {
-			// 暂停，等待恢复
 			for !runner.Running {
 				time.Sleep(100 * time.Millisecond)
 				select {
@@ -323,7 +308,6 @@ func (s *Server) runEnumerator(runner *JobRunner) {
 			ID:        taskID,
 			Mnemonics: batch,
 		}
-
 		runner.TaskQueue <- task
 	}
 
@@ -342,7 +326,6 @@ func (s *Server) handleFetchTask(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
-	// 更新worker信息
 	s.workersMu.Lock()
 	s.workers[req.WorkerID] = &WorkerInfo{
 		ID:       req.WorkerID,
@@ -350,7 +333,6 @@ func (s *Server) handleFetchTask(w http.ResponseWriter, r *http.Request) {
 	}
 	s.workersMu.Unlock()
 
-	// 查找有任务的任务
 	s.activeJobsMu.RLock()
 	defer s.activeJobsMu.RUnlock()
 
@@ -381,9 +363,9 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		WorkerID  string   `json:"worker_id"`
-		TaskID    int      `json:"task_id"`
-		Addresses []string `json:"addresses"`
+		WorkerID  string     `json:"worker_id"`
+		TaskID    int        `json:"task_id"`
+		Addresses []string   `json:"addresses"`
 		Mnemonics [][]string `json:"mnemonics"`
 	}
 
@@ -392,15 +374,13 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 更新worker
 	s.workersMu.Lock()
-	if w, exists := s.workers[req.WorkerID]; exists {
-		w.TasksDone++
-		w.LastSeen = time.Now()
+	if worker, exists := s.workers[req.WorkerID]; exists {
+		worker.TasksDone++
+		worker.LastSeen = time.Now()
 	}
 	s.workersMu.Unlock()
 
-	// 处理结果
 	matches := 0
 	for i, addrHex := range req.Addresses {
 		if addrHex == "" || len(req.Mnemonics) <= i {
@@ -411,23 +391,27 @@ func (s *Server) handleSubmitResult(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		_ = addr // 用于bloom过滤检查
 
-		// 简化：假设所有结果都需要检查
-		// 实际应该根据job的bloom过滤器
-		mnemonicStr := strings.Join(req.Mnemonics[i], " ")
+		// 使用全局Bloom过滤器检查
+		if s.bloomFilter != nil && s.bloomFilter.Contains(addr) {
+			mnemonicStr := strings.Join(req.Mnemonics[i], " ")
 
-		s.matchesMu.Lock()
-		s.matches = append(s.matches, Match{
-			Mnemonic: mnemonicStr,
-			Address:  addrHex,
-			Time:     time.Now(),
-		})
-		s.matchesMu.Unlock()
+			s.matchesMu.Lock()
+			s.matches = append(s.matches, Match{
+				Mnemonic: mnemonicStr,
+				Address:  addrHex,
+				Time:     time.Now(),
+			})
+			s.matchesMu.Unlock()
 
-		matches++
+			matches++
 
-		log.Printf("结果: %s -> %s", mnemonicStr, addrHex)
+			log.Printf("========== 找到匹配 ==========")
+			log.Printf("Worker: %s", req.WorkerID)
+			log.Printf("助记词: %s", mnemonicStr)
+			log.Printf("地址: %s", addrHex)
+			log.Printf("==============================")
+		}
 	}
 
 	json.NewEncoder(w).Encode(protocol.ResultResponse{
@@ -460,11 +444,21 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 // handleStats 统计信息
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := map[string]interface{}{
-		"jobs":    len(s.taskManager.ListJobs()),
-		"workers": len(s.workers),
-		"matches": len(s.matches),
+		"jobs":         len(s.taskManager.ListJobs()),
+		"workers":      len(s.workers),
+		"matches":      len(s.matches),
+		"bloom_loaded": s.bloomFilter != nil,
 	}
 	json.NewEncoder(w).Encode(stats)
+}
+
+// handleBloomInfo Bloom过滤器信息
+func (s *Server) handleBloomInfo(w http.ResponseWriter, r *http.Request) {
+	info := map[string]interface{}{
+		"loaded": s.bloomFilter != nil,
+		"file":   *bloomFile,
+	}
+	json.NewEncoder(w).Encode(info)
 }
 
 // restoreJobs 恢复任务
@@ -472,7 +466,6 @@ func (s *Server) restoreJobs() {
 	jobs := s.taskManager.ListJobs()
 	for _, job := range jobs {
 		if job.Status == "running" {
-			// 恢复运行中的任务
 			job.Status = "paused"
 			s.taskManager.UpdateJob(job)
 			log.Printf("恢复任务: %s (状态: paused)", job.ID)

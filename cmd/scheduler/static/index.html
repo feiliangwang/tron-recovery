@@ -74,6 +74,15 @@
         .btn-success { background: #16a34a; color: white; }
         .btn-small { padding: 6px 12px; font-size: 12px; }
 
+        /* Bloom状态 */
+        .bloom-status {
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+        }
+        .bloom-loaded { background: #166534; color: #4ade80; }
+        .bloom-not-loaded { background: #7c2d12; color: #fb923c; }
+
         /* 任务列表 */
         .jobs-header {
             display: flex;
@@ -250,8 +259,8 @@
             </div>
             <div class="form-row">
                 <div>
-                    <label>Bloom 过滤器文件（可选）</label>
-                    <input type="text" id="bloom-file" placeholder="例如: addresses.txt">
+                    <label>Bloom 状态</label>
+                    <div id="bloom-status" class="bloom-status bloom-not-loaded">检查中...</div>
                 </div>
                 <div style="display: flex; align-items: flex-end;">
                     <button class="btn btn-primary" onclick="createJob()">创建任务</button>
@@ -303,6 +312,7 @@
         async function refreshJobs() {
             const data = await fetchAPI('/jobs');
             jobs = data.jobs || [];
+            updateBloomStatus(data.bloom_loaded);
             renderJobs();
         }
 
@@ -310,7 +320,6 @@
             const name = document.getElementById('job-name').value;
             const mnemonic = document.getElementById('mnemonic').value;
             const batchSize = parseInt(document.getElementById('batch-size').value);
-            const bloomFile = document.getElementById('bloom-file').value;
 
             if (!mnemonic) {
                 alert('请输入助记词模板');
@@ -319,7 +328,7 @@
 
             await fetchAPI('/jobs', {
                 method: 'POST',
-                body: JSON.stringify({ name, mnemonic, batch_size: batchSize, bloom_file: bloomFile })
+                body: JSON.stringify({ name, mnemonic, batch_size: batchSize })
             });
 
             document.getElementById('job-name').value = '';
@@ -346,6 +355,17 @@
             if (!confirm('确定删除此任务？')) return;
             await fetchAPI('/jobs/' + id, { method: 'DELETE' });
             refreshJobs();
+        }
+
+        function updateBloomStatus(loaded) {
+            const el = document.getElementById('bloom-status');
+            if (loaded) {
+                el.className = 'bloom-status bloom-loaded';
+                el.textContent = '✅ 已加载 - 匹配功能已启用';
+            } else {
+                el.className = 'bloom-status bloom-not-loaded';
+                el.textContent = '⚠️ 未加载 - 请使用 -bloom 参数启动';
+            }
         }
 
         function renderJobs() {
