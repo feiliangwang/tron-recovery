@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"boon/internal/bloom"
 	"boon/internal/mnemonic"
 	"boon/internal/protocol"
 	"boon/internal/scheduler"
@@ -25,15 +24,13 @@ import (
 var staticFS embed.FS
 
 var (
-	dataDir   = flag.String("data", "./data", "数据目录")
-	port      = flag.Int("port", 8080, "HTTP服务端口")
-	bloomFile = flag.String("bloom", "", "Bloom过滤器文件（gob格式）")
+	dataDir = flag.String("data", "./data", "数据目录")
+	port    = flag.Int("port", 8080, "HTTP服务端口")
 )
 
 // Server 服务器
 type Server struct {
 	taskManager *scheduler.TaskManager
-	bloomFilter *bloom.Filter
 
 	jobs   map[string]*CompactJobRunner
 	jobsMu sync.RWMutex
@@ -80,21 +77,9 @@ func main() {
 		log.Fatalf("创建任务管理器失败: %v", err)
 	}
 
-	// 加载Bloom过滤器
-	var bf *bloom.Filter
-	if *bloomFile != "" {
-		log.Printf("加载Bloom过滤器: %s", *bloomFile)
-		bf, err = bloom.LoadFromFile(*bloomFile)
-		if err != nil {
-			log.Fatalf("加载Bloom过滤器失败: %v", err)
-		}
-		log.Println("Bloom过滤器加载完成")
-	}
-
 	// 创建服务器
 	server := &Server{
 		taskManager: tm,
-		bloomFilter: bf,
 		jobs:        make(map[string]*CompactJobRunner),
 		workers:     make(map[string]*WorkerInfo),
 	}
@@ -140,8 +125,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		jobs := s.taskManager.ListJobs()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"jobs":         jobs,
-			"bloom_loaded": s.bloomFilter != nil,
+			"jobs": jobs,
 		})
 		return
 	}
@@ -463,20 +447,19 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"jobs":         len(s.taskManager.ListJobs()),
-		"workers":      len(s.workers),
-		"matches":      len(s.matches),
-		"bloom_loaded": s.bloomFilter != nil,
-		"completed":    totalCompleted,
+		"jobs":      len(s.taskManager.ListJobs()),
+		"workers":   len(s.workers),
+		"matches":   len(s.matches),
+		"completed": totalCompleted,
 	})
 }
 
-// handleBloomInfo Bloom信息
+// handleBloomInfo Bloom信息（已废弃，保留兼容）
 func (s *Server) handleBloomInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"loaded": s.bloomFilter != nil,
-		"file":   *bloomFile,
+		"loaded": false,
+		"note":   "Bloom filter is now loaded by worker locally",
 	})
 }
 

@@ -71,13 +71,6 @@
         .btn-success { background: #16a34a; color: white; }
         .btn-small { padding: 6px 12px; font-size: 12px; }
 
-        .bloom-status {
-            padding: 8px 12px; border-radius: 8px; font-size: 13px;
-            display: inline-block;
-        }
-        .bloom-loaded { background: #166534; color: #4ade80; }
-        .bloom-not-loaded { background: #7c2d12; color: #fb923c; }
-
         /* 两栏布局 */
         .main-grid {
             display: grid;
@@ -202,8 +195,7 @@
                     <label>批次大小</label>
                     <input type="number" id="batch-size" value="10000">
                 </div>
-                <div style="display: flex; align-items: flex-end; gap: 12px;">
-                    <div id="bloom-status" class="bloom-status bloom-not-loaded">检查中...</div>
+                <div style="display: flex; align-items: flex-end;">
                     <button class="btn btn-primary" onclick="createJob()">创建任务</button>
                 </div>
             </div>
@@ -275,16 +267,6 @@
                 }
                 lastCompleted = completed;
                 lastTime = now;
-
-                // Bloom状态
-                const bloomEl = document.getElementById('bloom-status');
-                if (stats.bloom_loaded) {
-                    bloomEl.className = 'bloom-status bloom-loaded';
-                    bloomEl.textContent = '✅ Bloom已加载';
-                } else {
-                    bloomEl.className = 'bloom-status bloom-not-loaded';
-                    bloomEl.textContent = '⚠️ 未加载Bloom';
-                }
 
                 // 刷新任务
                 await refreshJobs();

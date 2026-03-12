@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"boon/internal/bloom"
 	"boon/internal/compute"
 	"boon/internal/protocol"
 )
@@ -16,6 +17,7 @@ type CompactWorker struct {
 	id          string
 	client      *CompactClient
 	computer    *compute.CompactComputer
+	bloomFilter *bloom.Filter // 本地Bloom过滤器
 
 	pollInterval time.Duration
 	workers      int
@@ -49,6 +51,11 @@ func NewCompactWorker(id string, client *CompactClient, workers int) *CompactWor
 		taskQueue:    make(chan *protocol.CompactTask, workers*2),
 		stopCh:       make(chan struct{}),
 	}
+}
+
+// SetBloomFilter 设置Bloom过滤器
+func (w *CompactWorker) SetBloomFilter(filter *bloom.Filter) {
+	w.bloomFilter = filter
 }
 
 // Start 启动Worker
@@ -176,8 +183,16 @@ func (w *CompactWorker) processTask(ctx context.Context, task *protocol.CompactT
 
 	start := time.Now()
 
+	// 创建Bloom过滤函数
+	var bloomFunc func([]byte) bool
+	if w.bloomFilter != nil {
+		bloomFunc = func(addr []byte) bool {
+			return w.bloomFilter.Contains(addr)
+		}
+	}
+
 	// 计算范围内的匹配
-	result := w.computer.ComputeRange(w.enumerator, task, nil)
+	result := w.computer.ComputeRange(w.enumerator, task, bloomFunc)
 
 	atomic.AddInt64(&w.stats.tasksComputed, 1)
 	atomic.AddInt64(&w.stats.indicesScanned, task.EndIdx-task.StartIdx)

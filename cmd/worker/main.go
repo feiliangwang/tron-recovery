@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"boon/internal/bloom"
 	"boon/internal/worker"
 )
 
@@ -19,6 +20,7 @@ var (
 	workerID     = flag.String("id", "", "Worker ID（留空自动生成）")
 	workers      = flag.Int("workers", runtime.NumCPU(), "并发计算线程数")
 	batchSize    = flag.Int64("batch", 10000, "每批次枚举数量")
+	bloomFile    = flag.String("bloom", "", "Bloom过滤器文件（本地加载）")
 )
 
 func main() {
@@ -31,6 +33,18 @@ func main() {
 		id = fmt.Sprintf("%s-%d", hostname, os.Getpid())
 	}
 
+	// 加载Bloom过滤器
+	var bloomFilter *bloom.Filter
+	if *bloomFile != "" {
+		log.Printf("加载Bloom过滤器: %s", *bloomFile)
+		var err error
+		bloomFilter, err = bloom.LoadFromFile(*bloomFile)
+		if err != nil {
+			log.Fatalf("加载Bloom过滤器失败: %v", err)
+		}
+		log.Println("Bloom过滤器加载完成")
+	}
+
 	log.Printf("========================================")
 	log.Printf("  Boon Worker v2 (紧凑协议)")
 	log.Printf("========================================")
@@ -38,6 +52,7 @@ func main() {
 	log.Printf("  调度服务器:    %s", *schedulerURL)
 	log.Printf("  计算线程:      %d", *workers)
 	log.Printf("  批次大小:      %d", *batchSize)
+	log.Printf("  Bloom过滤:     %s", boolStr(bloomFilter != nil, "已加载", "未加载"))
 	log.Printf("========================================")
 
 	// 创建紧凑协议客户端
@@ -45,6 +60,7 @@ func main() {
 
 	// 创建紧凑Worker
 	w := worker.NewCompactWorker(id, client, *workers)
+	w.SetBloomFilter(bloomFilter)
 
 	// 处理信号
 	ctx, cancel := context.WithCancel(context.Background())
@@ -73,4 +89,11 @@ func main() {
 	log.Printf("  Worker 已停止")
 	log.Printf("  运行时间: %v", elapsed)
 	log.Printf("========================================")
+}
+
+func boolStr(cond bool, trueStr, falseStr string) string {
+	if cond {
+		return trueStr
+	}
+	return falseStr
 }
