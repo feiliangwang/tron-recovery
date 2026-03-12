@@ -58,9 +58,9 @@ type CompactJobRunner struct {
 
 // WorkerInfo Worker信息
 type WorkerInfo struct {
-	ID        string
-	LastSeen  time.Time
-	TasksDone int64
+	ID        string    `json:"id"`
+	LastSeen  time.Time `json:"last_seen"`
+	TasksDone int64     `json:"tasks_done"`
 }
 
 // Match 匹配结果
