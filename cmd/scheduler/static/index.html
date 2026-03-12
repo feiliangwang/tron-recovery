@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Boon - TRON 助记词枚举</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #22d3ee;
+            font-size: 2em;
+        }
+
+        /* 创建任务表单 */
+        .create-form {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr 150px 120px;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .form-row.full { grid-template-columns: 1fr; }
+        label {
+            display: block;
+            margin-bottom: 6px;
+            color: #94a3b8;
+            font-size: 14px;
+        }
+        input, select {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            background: #0f172a;
+            color: #e2e8f0;
+            font-size: 14px;
+        }
+        input:focus, select:focus {
+            outline: none;
+            border-color: #22d3ee;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: #0891b2;
+            color: white;
+        }
+        .btn-primary:hover { background: #06b6d4; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-danger:hover { background: #ef4444; }
+        .btn-warning { background: #d97706; color: white; }
+        .btn-success { background: #16a34a; color: white; }
+        .btn-small { padding: 6px 12px; font-size: 12px; }
+
+        /* 任务列表 */
+        .jobs-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .jobs-grid {
+            display: grid;
+            gap: 16px;
+        }
+        .job-card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .job-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 12px;
+        }
+        .job-name {
+            font-size: 18px;
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+        .job-status {
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status-pending { background: #334155; color: #94a3b8; }
+        .status-running { background: #0891b2; color: white; }
+        .status-paused { background: #d97706; color: white; }
+        .status-completed { background: #16a34a; color: white; }
+
+        .job-mnemonic {
+            background: #0f172a;
+            padding: 12px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 13px;
+            margin-bottom: 16px;
+            color: #94a3b8;
+            word-break: break-all;
+        }
+
+        .job-progress {
+            margin-bottom: 16px;
+        }
+        .progress-bar {
+            height: 8px;
+            background: #334155;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #0891b2, #22d3ee);
+            transition: width 0.3s;
+        }
+        .progress-stats {
+            display: flex;
+            gap: 24px;
+            font-size: 13px;
+            color: #94a3b8;
+        }
+        .stat-value {
+            color: #f1f5f9;
+            font-weight: 500;
+        }
+
+        .job-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        /* Worker 状态 */
+        .workers-panel {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 24px;
+        }
+        .workers-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+        .worker-card {
+            background: #0f172a;
+            padding: 12px;
+            border-radius: 8px;
+        }
+        .worker-id {
+            font-weight: 500;
+            margin-bottom: 4px;
+        }
+        .worker-status {
+            font-size: 12px;
+            color: #94a3b8;
+        }
+
+        /* 匹配结果 */
+        .matches-panel {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 24px;
+        }
+        .match-item {
+            background: #0f172a;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        .match-address {
+            color: #22d3ee;
+            margin-bottom: 4px;
+        }
+        .match-mnemonic {
+            color: #94a3b8;
+            font-size: 12px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #64748b;
+        }
+
+        .refresh-btn {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #0891b2;
+            color: white;
+            border: none;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🍉 Boon - TRON 助记词枚举</h1>
+
+        <!-- 创建任务 -->
+        <div class="create-form">
+            <h3 style="margin-bottom: 16px; color: #f1f5f9;">创建任务</h3>
+            <div class="form-row">
+                <div>
+                    <label>任务名称</label>
+                    <input type="text" id="job-name" placeholder="例如: 钱包A恢复">
+                </div>
+                <div>
+                    <label>批次大小</label>
+                    <input type="number" id="batch-size" value="1000">
+                </div>
+            </div>
+            <div class="form-row full">
+                <label>助记词模板（未知词用 ? 代替）</label>
+                <input type="text" id="mnemonic" placeholder="例如: word1 word2 ? ? word5 word6 word7 word8 word9 word10 word11 word12">
+            </div>
+            <div class="form-row">
+                <div>
+                    <label>Bloom 过滤器文件（可选）</label>
+                    <input type="text" id="bloom-file" placeholder="例如: addresses.txt">
+                </div>
+                <div style="display: flex; align-items: flex-end;">
+                    <button class="btn btn-primary" onclick="createJob()">创建任务</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 任务列表 -->
+        <div class="jobs-header">
+            <h2>任务列表</h2>
+            <button class="btn btn-small btn-primary" onclick="refreshJobs()">刷新</button>
+        </div>
+        <div class="jobs-grid" id="jobs-grid">
+            <div class="empty-state">暂无任务</div>
+        </div>
+
+        <!-- 匹配结果 -->
+        <div class="matches-panel">
+            <h3>🎯 匹配结果</h3>
+            <div id="matches-list">
+                <div class="empty-state">暂无匹配</div>
+            </div>
+        </div>
+
+        <!-- Workers -->
+        <div class="workers-panel">
+            <h3>👷 Workers</h3>
+            <div class="workers-grid" id="workers-grid">
+                <div class="empty-state">暂无连接</div>
+            </div>
+        </div>
+    </div>
+
+    <button class="refresh-btn" onclick="refreshJobs()">↻</button>
+
+    <script>
+        let jobs = [];
+        let workers = [];
+        let matches = [];
+
+        async function fetchAPI(path, options = {}) {
+            const res = await fetch('/api' + path, {
+                ...options,
+                headers: { 'Content-Type': 'application/json' }
+            });
+            return res.json();
+        }
+
+        async function refreshJobs() {
+            const data = await fetchAPI('/jobs');
+            jobs = data.jobs || [];
+            renderJobs();
+        }
+
+        async function createJob() {
+            const name = document.getElementById('job-name').value;
+            const mnemonic = document.getElementById('mnemonic').value;
+            const batchSize = parseInt(document.getElementById('batch-size').value);
+            const bloomFile = document.getElementById('bloom-file').value;
+
+            if (!mnemonic) {
+                alert('请输入助记词模板');
+                return;
+            }
+
+            await fetchAPI('/jobs', {
+                method: 'POST',
+                body: JSON.stringify({ name, mnemonic, batch_size: batchSize, bloom_file: bloomFile })
+            });
+
+            document.getElementById('job-name').value = '';
+            document.getElementById('mnemonic').value = '';
+            refreshJobs();
+        }
+
+        async function startJob(id) {
+            await fetchAPI('/jobs/' + id + '/start', { method: 'POST' });
+            refreshJobs();
+        }
+
+        async function pauseJob(id) {
+            await fetchAPI('/jobs/' + id + '/pause', { method: 'POST' });
+            refreshJobs();
+        }
+
+        async function resumeJob(id) {
+            await fetchAPI('/jobs/' + id + '/resume', { method: 'POST' });
+            refreshJobs();
+        }
+
+        async function deleteJob(id) {
+            if (!confirm('确定删除此任务？')) return;
+            await fetchAPI('/jobs/' + id, { method: 'DELETE' });
+            refreshJobs();
+        }
+
+        function renderJobs() {
+            const grid = document.getElementById('jobs-grid');
+
+            if (jobs.length === 0) {
+                grid.innerHTML = '<div class="empty-state">暂无任务</div>';
+                return;
+            }
+
+            grid.innerHTML = jobs.map(job => {
+                const progress = job.total > 0 ? (job.completed / job.total * 100).toFixed(1) : 0;
+                const statusClass = 'status-' + job.status;
+
+                let actions = '';
+                if (job.status === 'pending') {
+                    actions = `<button class="btn btn-small btn-success" onclick="startJob('${job.id}')">启动</button>`;
+                } else if (job.status === 'running') {
+                    actions = `<button class="btn btn-small btn-warning" onclick="pauseJob('${job.id}')">暂停</button>`;
+                } else if (job.status === 'paused') {
+                    actions = `<button class="btn btn-small btn-success" onclick="resumeJob('${job.id}')">恢复</button>`;
+                }
+                actions += `<button class="btn btn-small btn-danger" onclick="deleteJob('${job.id}')">删除</button>`;
+
+                return `
+                    <div class="job-card">
+                        <div class="job-header">
+                            <div class="job-name">${job.name || job.id}</div>
+                            <span class="job-status ${statusClass}">${job.status}</span>
+                        </div>
+                        <div class="job-mnemonic">${job.mnemonic}</div>
+                        <div class="job-progress">
+                            <div class="progress-bar">
+                                <div class="progress-fill" style="width: ${progress}%"></div>
+                            </div>
+                            <div class="progress-stats">
+                                <span>进度: <span class="stat-value">${progress}%</span></span>
+                                <span>完成: <span class="stat-value">${job.completed.toLocaleString()}</span></span>
+                                <span>总计: <span class="stat-value">${job.total.toLocaleString()}</span></span>
+                                <span>匹配: <span class="stat-value">${job.matches}</span></span>
+                            </div>
+                        </div>
+                        <div class="job-actions">${actions}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // 自动刷新
+        setInterval(refreshJobs, 2000);
+        refreshJobs();
+    </script>
+</body>
+</html>
