@@ -1,8 +1,7 @@
 package bloom
 
 import (
-	"bufio"
-	"encoding/hex"
+	"encoding/gob"
 	"os"
 
 	"github.com/bits-and-blooms/bloom/v3"
@@ -20,8 +19,7 @@ func NewFilter(expectedItems uint, falsePositiveRate float64) *Filter {
 	}
 }
 
-// LoadFromFile 从文件加载Bloom过滤器
-// 文件格式：每行一个hex编码的20字节地址
+// LoadFromFile 从文件加载Bloom过滤器（gob格式）
 func LoadFromFile(filename string) (*Filter, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -29,36 +27,25 @@ func LoadFromFile(filename string) (*Filter, error) {
 	}
 	defer file.Close()
 
-	// 先统计行数
-	lineCount := 0
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if len(scanner.Bytes()) > 0 {
-			lineCount++
-		}
+	bf := bloom.New(0, 0) // 创建空的过滤器
+	decoder := gob.NewDecoder(file)
+	if err := decoder.Decode(bf); err != nil {
+		return nil, err
 	}
 
-	// 创建Bloom过滤器
-	filter := NewFilter(uint(lineCount*2), 0.001)
+	return &Filter{filter: bf}, nil
+}
 
-	// 重新读取文件添加数据
-	file.Seek(0, 0)
-	scanner = bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) == 0 {
-			continue
-		}
-		data, err := hex.DecodeString(line)
-		if err != nil {
-			continue
-		}
-		if len(data) == 20 {
-			filter.Add(data)
-		}
+// SaveToFile 保存Bloom过滤器到文件（gob格式）
+func (f *Filter) SaveToFile(filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
 	}
+	defer file.Close()
 
-	return filter, nil
+	encoder := gob.NewEncoder(file)
+	return encoder.Encode(f.filter)
 }
 
 // Add 添加数据到过滤器
@@ -74,4 +61,9 @@ func (f *Filter) Contains(data []byte) bool {
 // TestAndAdd 测试并添加
 func (f *Filter) TestAndAdd(data []byte) bool {
 	return f.filter.TestAndAdd(data)
+}
+
+// Clear 清空过滤器
+func (f *Filter) Clear() {
+	f.filter.ClearAll()
 }

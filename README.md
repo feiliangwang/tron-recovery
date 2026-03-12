@@ -154,13 +154,32 @@ GET /api/stats
 
 ## Bloom 过滤器文件格式
 
-每行一个地址（hex 编码，20 字节）：
+Bloom 过滤器使用 gob 编码格式存储。
+
+### 生成 Bloom 文件
+
+```bash
+# 从地址列表生成 Bloom 过滤器
+./build/bloomtool -input addresses.txt -output bloom.gob
+```
+
+**输入文件格式**（每行一个 hex 地址）：
 
 ```
 a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
 b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3
 ...
 ```
+
+**输出文件**: gob 编码的 Bloom 过滤器
+
+### 在调度器中使用
+
+```bash
+./build/scheduler -bloom bloom.gob
+```
+
+或在 Web UI 创建任务时填写 Bloom 文件路径。
 
 ## 性能估算
 
