@@ -42,7 +42,7 @@ func NewLocalEnumerator(template *TaskTemplate) *LocalEnumerator {
 // EnumerateAt 枚举指定索引位置的助记词
 // 实现 compute.Enumerator 接口
 func (e *LocalEnumerator) EnumerateAt(idx int64, validator *mnemonic.Validator) ([]string, bool) {
-	words := make([]string, 12)
+	words := make([]string, len(e.template.Words))
 	copy(words, e.template.Words)
 
 	// 将索引转换为各位置的词索引

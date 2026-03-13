@@ -12,20 +12,23 @@ import (
 	"boon/internal/protocol"
 )
 
+// pendingTask 带模板的待处理任务（每次从服务器获取，不在本地存储）
+type pendingTask struct {
+	task     *protocol.CompactTask
+	template *TaskTemplate
+}
+
 // CompactWorker 紧凑协议Worker
 type CompactWorker struct {
 	id          string
 	client      *CompactClient
 	computer    *compute.CompactComputer
-	bloomFilter *bloom.Filter // 本地Bloom过滤器
+	bloomFilter *bloom.Filter // 本地Bloom过滤器（可选）
 
 	pollInterval time.Duration
 	workers      int
 
-	template   *TaskTemplate
-	enumerator *LocalEnumerator
-
-	taskQueue chan *protocol.CompactTask
+	taskQueue chan *pendingTask
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 
@@ -37,6 +40,7 @@ type CompactWorker struct {
 		tasksComputed  int64
 		matchesFound   int64
 		indicesScanned int64
+		currentSpeed   int64 // 当前枚举速度（indices/s），上报给调度器用于动态分配
 	}
 }
 
@@ -45,10 +49,10 @@ func NewCompactWorker(id string, client *CompactClient, workers int) *CompactWor
 	return &CompactWorker{
 		id:           id,
 		client:       client,
-		computer:     compute.NewCompactComputer(workers),
+		computer:     compute.NewCompactComputer(workers, compute.NewCPUComputer()),
 		pollInterval: 50 * time.Millisecond,
 		workers:      workers,
-		taskQueue:    make(chan *protocol.CompactTask, workers*2),
+		taskQueue:    make(chan *pendingTask, 2), // 1个计算中 + 1个预取
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -68,11 +72,9 @@ func (w *CompactWorker) Start(ctx context.Context) {
 	w.wg.Add(1)
 	go w.runFetcher(ctx)
 
-	// 启动计算worker
-	for i := 0; i < w.workers; i++ {
-		w.wg.Add(1)
-		go w.runComputer(ctx)
-	}
+	// 启动计算worker（1个即可，CompactComputer内部已经并行处理）
+	w.wg.Add(1)
+	go w.runComputer(ctx)
 
 	// 启动统计
 	w.wg.Add(1)
@@ -86,12 +88,6 @@ func (w *CompactWorker) Stop() {
 	}
 	close(w.stopCh)
 	w.wg.Wait()
-}
-
-// SetTemplate 设置任务模板
-func (w *CompactWorker) SetTemplate(template *TaskTemplate) {
-	w.template = template
-	w.enumerator = NewLocalEnumerator(template)
 }
 
 // runFetcher 任务拉取器
@@ -117,7 +113,7 @@ func (w *CompactWorker) runFetcher(ctx context.Context) {
 	}
 }
 
-// fetchTasks 拉取任务
+// fetchTasks 拉取任务，携带当前速度，每次都从服务器获取模板，不做本地缓存
 func (w *CompactWorker) fetchTasks(ctx context.Context, count int) {
 	for i := 0; i < count; i++ {
 		select {
@@ -126,29 +122,31 @@ func (w *CompactWorker) fetchTasks(ctx context.Context, count int) {
 		default:
 		}
 
-		task, err := w.client.FetchTask(w.id)
+		// 携带当前枚举速度，让调度器动态决定分配多大的枚举空间
+		speed := atomic.LoadInt64(&w.stats.currentSpeed)
+		task, err := w.client.FetchTask(w.id, speed)
 		if err != nil {
+			log.Printf("[Worker %s] 拉取任务失败: %v", w.id, err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-
 		if task == nil {
-			break
+			break // 当前没有可用任务
 		}
 
-		// 获取模板（如果需要）
-		if w.enumerator == nil {
-			tmpl, err := w.client.FetchTemplate(task.JobID)
-			if err != nil {
-				log.Printf("[Worker %s] 获取模板失败: %v", w.id, err)
-				continue
-			}
-			w.SetTemplate(tmpl)
-			log.Printf("[Worker %s] 模板加载完成, 未知位置: %v", w.id, tmpl.UnknownPos)
+		// 每次都从服务器拉取模板，不在本地存储
+		tmpl, err := w.client.FetchTemplate(task.JobID)
+		if err != nil {
+			log.Printf("[Worker %s] 获取模板失败: %v", w.id, err)
+			continue
+		}
+		if tmpl == nil {
+			log.Printf("[Worker %s] 模板暂不可用，稍后重试", w.id)
+			continue
 		}
 
 		select {
-		case w.taskQueue <- task:
+		case w.taskQueue <- &pendingTask{task: task, template: tmpl}:
 			atomic.AddInt64(&w.stats.tasksFetched, 1)
 		case <-ctx.Done():
 			return
@@ -166,22 +164,22 @@ func (w *CompactWorker) runComputer(ctx context.Context) {
 			return
 		case <-w.stopCh:
 			return
-		case task, ok := <-w.taskQueue:
+		case pt, ok := <-w.taskQueue:
 			if !ok {
 				return
 			}
-			w.processTask(ctx, task)
+			w.processTask(ctx, pt)
 		}
 	}
 }
 
-// processTask 处理任务
-func (w *CompactWorker) processTask(ctx context.Context, task *protocol.CompactTask) {
-	if w.enumerator == nil {
-		return
-	}
-
+// processTask 处理任务，枚举器从模板即时创建，用完即丢，完成后更新速度
+func (w *CompactWorker) processTask(ctx context.Context, pt *pendingTask) {
 	start := time.Now()
+	indices := pt.task.EndIdx - pt.task.StartIdx
+
+	// 从本次任务的模板创建枚举器（不存储，用完即丢）
+	enum := NewLocalEnumerator(pt.template)
 
 	// 创建Bloom过滤函数
 	var bloomFunc func([]byte) bool
@@ -192,21 +190,35 @@ func (w *CompactWorker) processTask(ctx context.Context, task *protocol.CompactT
 	}
 
 	// 计算范围内的匹配
-	result := w.computer.ComputeRange(w.enumerator, task, bloomFunc)
+	result := w.computer.ComputeRange(enum, pt.task, bloomFunc)
+
+	elapsed := time.Since(start)
 
 	atomic.AddInt64(&w.stats.tasksComputed, 1)
-	atomic.AddInt64(&w.stats.indicesScanned, task.EndIdx-task.StartIdx)
+	atomic.AddInt64(&w.stats.indicesScanned, indices)
+
+	// 更新枚举速度（EWMA，平滑抖动），供下次握手上报给调度器
+	if elapsed > 0 {
+		newSpeed := int64(float64(indices) / elapsed.Seconds())
+		oldSpeed := atomic.LoadInt64(&w.stats.currentSpeed)
+		var smoothed int64
+		if oldSpeed == 0 {
+			smoothed = newSpeed
+		} else {
+			smoothed = int64(float64(oldSpeed)*0.8 + float64(newSpeed)*0.2)
+		}
+		atomic.StoreInt64(&w.stats.currentSpeed, smoothed)
+	}
 
 	// 提交结果
 	for retry := 0; retry < 3; retry++ {
 		err := w.client.SubmitResult(w.id, result)
 		if err == nil {
 			atomic.AddInt64(&w.stats.matchesFound, int64(len(result.Matches)))
-			elapsed := time.Since(start)
-			rate := float64(task.EndIdx-task.StartIdx) / elapsed.Seconds()
+			rate := float64(indices) / elapsed.Seconds()
 			if len(result.Matches) > 0 {
 				log.Printf("[Worker %s] 匹配! task=%d matches=%d 速率=%.0f/s",
-					w.id, task.TaskID, len(result.Matches), rate)
+					w.id, pt.task.TaskID, len(result.Matches), rate)
 			}
 			return
 		}
@@ -232,10 +244,11 @@ func (w *CompactWorker) printStats(ctx context.Context) {
 			computed := atomic.LoadInt64(&w.stats.tasksComputed)
 			scanned := atomic.LoadInt64(&w.stats.indicesScanned)
 			matches := atomic.LoadInt64(&w.stats.matchesFound)
+			speed := atomic.LoadInt64(&w.stats.currentSpeed)
 			queue := len(w.taskQueue)
 
-			log.Printf("[Worker %s] 任务=%d 扫描=%d 匹配=%d 队列=%d",
-				w.id, computed, scanned, matches, queue)
+			log.Printf("[Worker %s] 任务=%d 扫描=%d 匹配=%d 速度=%d/s 队列=%d",
+				w.id, computed, scanned, matches, speed, queue)
 		}
 	}
 }

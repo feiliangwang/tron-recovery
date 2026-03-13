@@ -1,75 +1,69 @@
 package compute
 
 import (
-	"crypto/sha512"
-	"strings"
-	"sync"
-
-	"boon/internal/bip44"
-	"boon/internal/crypto"
-	"golang.org/x/crypto/pbkdf2"
+	"github.com/btcsuite/btcd/btcutil/hdkeychain"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/tyler-smith/go-bip39"
+	"golang.org/x/crypto/sha3"
 )
 
 // CPUComputer CPU计算器
 type CPUComputer struct {
-	workers int
 }
 
 // NewCPUComputer 创建CPU计算器
-func NewCPUComputer(workers int) *CPUComputer {
-	if workers <= 0 {
-		workers = 4
-	}
-	return &CPUComputer{workers: workers}
+func NewCPUComputer() *CPUComputer {
+	return &CPUComputer{}
 }
 
 // Compute 计算助记词对应的TRON地址
-func (c *CPUComputer) Compute(mnemonics [][]string) ([][]byte, error) {
-	count := len(mnemonics)
-	addresses := make([][]byte, count)
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, c.workers)
-
-	for i, words := range mnemonics {
-		wg.Add(1)
-		go func(idx int, w []string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			address := c.computeOne(w)
-			addresses[idx] = address
-		}(i, words)
+func (c *CPUComputer) Compute(mnemonics []string) [][]byte {
+	addresses := make([][]byte, len(mnemonics))
+	for i, mnemonic := range mnemonics {
+		addresses[i] = c.computeOne(mnemonic)
 	}
-
-	wg.Wait()
-	return addresses, nil
+	return addresses
 }
 
 // computeOne 计算单个助记词对应的TRON地址
-func (c *CPUComputer) computeOne(words []string) []byte {
-	// 1. 拼接助记词
-	mnemonic := strings.Join(words, " ")
-
-	// 2. PBKDF2-HMAC-SHA512 计算种子
-	seed := pbkdf2.Key([]byte(mnemonic), []byte("mnemonic"), 2048, 64, sha512.New)
-
+func (c *CPUComputer) computeOne(mnemonic string) []byte {
+	seed := bip39.NewSeed(mnemonic, "")
 	// 3. BIP44 派生 TRON 路径 m/44'/195'/0'/0/0
-	deriver := bip44.NewDeriverFromSeed(seed)
-	key, err := deriver.DeriveTRON()
+	// 3. m/44'/195'/0'/0'/0'
+	masterKey, err := hdkeychain.NewMaster(seed, &chaincfg.MainNetParams)
 	if err != nil {
-		return nil
+		panic(err)
 	}
-
-	// 4. 获取公钥（未压缩，去掉04前缀）
-	pubKeyBytes, err := bip44.GetPublicKeyBytes(key)
+	purpose, err := masterKey.Derive(hdkeychain.HardenedKeyStart + 44)
 	if err != nil {
-		return nil
+		panic(err)
 	}
-
-	// 5. Keccak256 并取前20字节
-	return crypto.Keccak256Hash(pubKeyBytes)
+	coinType, err := purpose.Derive(hdkeychain.HardenedKeyStart + 195)
+	if err != nil {
+		panic(err)
+	}
+	account, err := coinType.Derive(hdkeychain.HardenedKeyStart + 0)
+	if err != nil {
+		panic(err)
+	}
+	change, err := account.Derive(0)
+	if err != nil {
+		panic(err)
+	}
+	addrKey, err := change.Derive(0)
+	if err != nil {
+		panic(err)
+	}
+	// 4. private key
+	privKey, err := addrKey.ECPrivKey()
+	if err != nil {
+		panic(err)
+	}
+	pubBytes := privKey.PubKey().SerializeUncompressed()[1:] // 去掉 0x04
+	hash := sha3.NewLegacyKeccak256()
+	hash.Write(pubBytes)
+	sum := hash.Sum(nil)
+	return sum[len(sum)-20:]
 }
 
 // Close 关闭CPU计算器

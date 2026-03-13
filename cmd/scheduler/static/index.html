@@ -49,7 +49,7 @@
         }
         .form-row {
             display: grid;
-            grid-template-columns: 1fr 150px 200px;
+            grid-template-columns: 1fr 200px;
             gap: 16px;
             margin-bottom: 12px;
         }
@@ -60,6 +60,9 @@
             border-radius: 8px; background: #0f172a; color: #e2e8f0; font-size: 14px;
         }
         input:focus { outline: none; border-color: #22d3ee; }
+        .batch-hint {
+            font-size: 12px; color: #64748b; margin-top: 6px; text-align: center;
+        }
         .btn {
             padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer;
             font-size: 14px; font-weight: 500; transition: all 0.2s;
@@ -74,7 +77,7 @@
         /* 两栏布局 */
         .main-grid {
             display: grid;
-            grid-template-columns: 1fr 400px;
+            grid-template-columns: 1fr 420px;
             gap: 24px;
         }
 
@@ -112,7 +115,12 @@
             transition: width 0.3s;
         }
         .progress-stats {
-            display: flex; gap: 16px; font-size: 12px; color: #94a3b8;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px 16px;
+            font-size: 12px;
+            color: #94a3b8;
+            margin-bottom: 6px;
         }
         .stat-value { color: #f1f5f9; font-weight: 500; }
         .job-actions { display: flex; gap: 6px; margin-top: 12px; }
@@ -123,30 +131,82 @@
         }
         .worker-card {
             background: #0f172a; padding: 12px; border-radius: 8px; margin-bottom: 8px;
+            border-left: 3px solid transparent;
+            transition: border-color 0.3s;
         }
+        .worker-card.online { border-left-color: #4ade80; }
+        .worker-card.offline { border-left-color: #f87171; }
         .worker-header {
             display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
         }
-        .worker-id { font-weight: 500; font-size: 13px; }
-        .worker-online { color: #4ade80; font-size: 11px; }
-        .worker-offline { color: #f87171; font-size: 11px; }
-        .worker-stats {
-            display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;
-            font-size: 11px; color: #94a3b8;
+        .worker-id {
+            font-weight: 600; font-size: 13px;
+            max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
-        .worker-stat-value { color: #22d3ee; font-weight: 500; }
+        .worker-badge {
+            padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500;
+        }
+        .badge-online { background: #14532d; color: #4ade80; }
+        .badge-offline { background: #450a0a; color: #f87171; }
+
+        /* Worker 速度显示 */
+        .worker-speed-row {
+            display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+        }
+        .worker-speed-label { font-size: 11px; color: #64748b; flex-shrink: 0; }
+        .worker-speed-value {
+            font-size: 16px; font-weight: 700; color: #22d3ee; flex-shrink: 0;
+        }
+        .speed-bar-wrap {
+            flex: 1; height: 4px; background: #1e293b; border-radius: 2px; overflow: hidden;
+        }
+        .speed-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #0891b2, #22d3ee);
+            border-radius: 2px;
+            transition: width 0.5s ease;
+        }
+
+        .worker-meta {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+            font-size: 11px; color: #64748b;
+        }
+        .worker-meta span { color: #94a3b8; }
+        .worker-meta b { color: #cbd5e1; }
 
         /* 匹配结果 */
         .matches-panel {
             background: #1e293b; border-radius: 12px; padding: 16px; margin-top: 24px;
         }
+        /* 确认成功 - 独立栏目 */
+        .confirmed-panel {
+            background: #052e16; border: 1px solid #16a34a;
+            border-radius: 12px; padding: 16px; margin-top: 24px;
+        }
+        .confirmed-panel .section-title h3 { color: #4ade80; }
+        .confirmed-item {
+            background: #0f172a; border: 1px solid #16a34a;
+            padding: 14px; border-radius: 8px; margin-bottom: 8px;
+            font-family: monospace; font-size: 12px;
+        }
+        .confirmed-item .match-address { color: #4ade80; font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+        .confirmed-item .match-create-time { color: #86efac; font-size: 11px; margin-bottom: 4px; }
+        .confirmed-item .match-mnemonic { color: #94a3b8; font-size: 11px; word-break: break-all; }
         .match-item {
             background: #0f172a; padding: 12px; border-radius: 8px; margin-bottom: 8px;
             font-family: monospace; font-size: 12px;
         }
         .match-address { color: #22d3ee; margin-bottom: 4px; }
         .match-mnemonic { color: #94a3b8; font-size: 11px; word-break: break-all; }
+        .match-confirm-badge {
+            display: inline-block; padding: 2px 8px; border-radius: 10px;
+            font-size: 10px; font-weight: 600; margin-bottom: 6px;
+        }
+        .badge-pending  { background: #1e293b; color: #94a3b8; }
+        .badge-active   { background: #14532d; color: #4ade80; }
+        .badge-inactive { background: #1c1917; color: #78716c; }
+        .badge-error    { background: #431407; color: #fb923c; }
 
         .empty-state { text-align: center; padding: 30px; color: #64748b; font-size: 13px; }
 
@@ -172,7 +232,7 @@
             </div>
             <div class="status-card">
                 <div class="status-value" id="stat-speed">0</div>
-                <div class="status-label">扫描/秒</div>
+                <div class="status-label">总枚举速度 /s</div>
             </div>
             <div class="status-card">
                 <div class="status-value" id="stat-completed">0</div>
@@ -191,18 +251,15 @@
                     <label>任务名称</label>
                     <input type="text" id="job-name" placeholder="例如: 钱包A恢复">
                 </div>
-                <div>
-                    <label>批次大小</label>
-                    <input type="number" id="batch-size" value="10000">
-                </div>
                 <div style="display: flex; align-items: flex-end;">
-                    <button class="btn btn-primary" onclick="createJob()">创建任务</button>
+                    <button class="btn btn-primary" style="width:100%" onclick="createJob()">创建任务</button>
                 </div>
             </div>
             <div class="form-row full">
                 <label>助记词模板（未知词用 ? 代替）</label>
                 <input type="text" id="mnemonic" placeholder="例如: word1 ? ? word4 word5 word6 word7 word8 word9 word10 word11 word12">
             </div>
+            <div class="batch-hint">💡 批次大小由调度器根据各 Worker 实时枚举速度自动分配，目标每批约 30 秒工作量</div>
         </div>
 
         <!-- 主内容 -->
@@ -213,6 +270,15 @@
                     <h2>任务列表</h2>
                 </div>
                 <div id="jobs-grid"></div>
+
+                <!-- 确认成功（已激活账户）-->
+                <div class="confirmed-panel" id="confirmed-panel" style="display:none">
+                    <div class="section-title">
+                        <h3>🏆 已激活账户</h3>
+                        <span id="confirmed-count" style="color: #4ade80; font-size: 13px;"></span>
+                    </div>
+                    <div id="confirmed-list"></div>
+                </div>
 
                 <!-- 匹配结果 -->
                 <div class="matches-panel">
@@ -238,9 +304,8 @@
     <div class="refresh-indicator" id="refresh-indicator">刷新中...</div>
 
     <script>
-        let lastCompleted = 0;
-        let lastTime = Date.now();
-        let refreshInterval;
+        // 记录各 Worker 历史最高速度，用于绘制相对进度条
+        const peakSpeeds = {};
 
         async function fetchAPI(path) {
             const res = await fetch('/api' + path);
@@ -252,27 +317,30 @@
             indicator.classList.add('show');
 
             try {
-                // 获取统计
-                const stats = await fetchAPI('/stats');
-                document.getElementById('stat-workers').textContent = stats.workers || 0;
+                const [stats, workersData] = await Promise.all([
+                    fetchAPI('/stats'),
+                    fetchAPI('/workers'),
+                ]);
+
+                const workers = workersData.workers || [];
+
+                // 状态栏
+                const onlineCount = workers.filter(w => isOnline(w)).length;
+                document.getElementById('stat-workers').textContent = onlineCount;
                 document.getElementById('stat-completed').textContent = formatNum(stats.completed || 0);
                 document.getElementById('stat-matches').textContent = stats.matches || 0;
 
-                // 计算速度
-                const now = Date.now();
-                const completed = stats.completed || 0;
-                const speed = Math.round((completed - lastCompleted) / ((now - lastTime) / 1000));
-                if (speed > 0 || lastCompleted > 0) {
-                    document.getElementById('stat-speed').textContent = formatNum(speed);
-                }
-                lastCompleted = completed;
-                lastTime = now;
+                // 总速度 = 各在线 Worker 速度之和
+                const totalSpeed = workers
+                    .filter(w => isOnline(w))
+                    .reduce((sum, w) => sum + (w.speed || 0), 0);
+                document.getElementById('stat-speed').textContent = formatNum(totalSpeed);
 
                 // 刷新任务
                 await refreshJobs();
 
-                // 刷新Workers
-                await refreshWorkers();
+                // 刷新 Workers（传入总速度供进度条参考）
+                renderWorkers(workers);
 
                 // 刷新匹配
                 await refreshMatches();
@@ -280,6 +348,10 @@
             } finally {
                 setTimeout(() => indicator.classList.remove('show'), 300);
             }
+        }
+
+        function isOnline(w) {
+            return w.last_seen && (Date.now() - new Date(w.last_seen).getTime()) < 60000;
         }
 
         async function refreshJobs() {
@@ -295,6 +367,24 @@
             grid.innerHTML = jobs.map(job => {
                 const progress = job.total > 0 ? (job.completed / job.total * 100).toFixed(2) : 0;
                 const statusClass = 'status-' + job.status;
+
+                // 运行时长
+                const elapsed = job.elapsed_seconds > 0 ? formatDuration(job.elapsed_seconds) : '-';
+
+                // 预计完成
+                let eta = '-';
+                if (job.status === 'running') {
+                    if (job.eta_seconds >= 0) {
+                        eta = job.eta_seconds === 0 ? '即将完成' : formatDuration(job.eta_seconds);
+                    } else {
+                        eta = '计算中...';
+                    }
+                } else if (job.status === 'completed') {
+                    eta = '已完成';
+                }
+
+                // 当前速度
+                const speed = job.speed > 0 ? formatNum(job.speed) + '/s' : '-';
 
                 let actions = '';
                 if (job.status === 'pending') {
@@ -318,8 +408,11 @@
                         </div>
                         <div class="progress-stats">
                             <span>进度: <span class="stat-value">${progress}%</span></span>
-                            <span>完成: <span class="stat-value">${formatNum(job.completed)}</span></span>
+                            <span>已完成: <span class="stat-value">${formatNum(job.completed)}</span></span>
                             <span>总计: <span class="stat-value">${formatNum(job.total)}</span></span>
+                            <span>速度: <span class="stat-value">${speed}</span></span>
+                            <span>运行时长: <span class="stat-value">${elapsed}</span></span>
+                            <span>预计完成: <span class="stat-value">${eta}</span></span>
                             <span>匹配: <span class="stat-value">${job.matches || 0}</span></span>
                         </div>
                         <div class="job-actions">${actions}</div>
@@ -328,11 +421,8 @@
             }).join('');
         }
 
-        async function refreshWorkers() {
-            const data = await fetchAPI('/workers');
-            const workers = data.workers || [];
+        function renderWorkers(workers) {
             const list = document.getElementById('workers-list');
-
             document.getElementById('worker-count').textContent = `${workers.length} 个`;
 
             if (workers.length === 0) {
@@ -340,21 +430,39 @@
                 return;
             }
 
-            const now = Date.now();
+            // 更新峰值速度记录（用于进度条比例）
+            workers.forEach(w => {
+                const s = w.speed || 0;
+                if (s > (peakSpeeds[w.id] || 0)) peakSpeeds[w.id] = s;
+            });
+            const globalPeak = Math.max(...Object.values(peakSpeeds), 1);
+
             list.innerHTML = workers.map(w => {
-                const isOnline = w.last_seen && (now - new Date(w.last_seen).getTime()) < 60000;
-                const statusClass = isOnline ? 'worker-online' : 'worker-offline';
-                const statusText = isOnline ? '🟢 在线' : '🔴 离线';
+                const online = isOnline(w);
+                const speed = w.speed || 0;
+                const barPct = Math.min(100, Math.round(speed / globalPeak * 100));
+                // 根据速度估算当前批次大小（speed × 30）
+                const batchEst = speed > 0 ? formatNum(speed * 30) : '-';
 
                 return `
-                    <div class="worker-card">
+                    <div class="worker-card ${online ? 'online' : 'offline'}">
                         <div class="worker-header">
-                            <span class="worker-id">${w.id}</span>
-                            <span class="${statusClass}">${statusText}</span>
+                            <span class="worker-id" title="${w.id}">${w.id}</span>
+                            <span class="worker-badge ${online ? 'badge-online' : 'badge-offline'}">
+                                ${online ? '🟢 在线' : '🔴 离线'}
+                            </span>
                         </div>
-                        <div class="worker-stats">
-                            <div>任务数: <span class="worker-stat-value">${w.tasks_done || 0}</span></div>
-                            <div>最后活跃: <span class="worker-stat-value">${formatTime(w.last_seen)}</span></div>
+                        <div class="worker-speed-row">
+                            <span class="worker-speed-label">速度</span>
+                            <span class="worker-speed-value">${formatNum(speed)}/s</span>
+                            <div class="speed-bar-wrap">
+                                <div class="speed-bar-fill" style="width:${barPct}%"></div>
+                            </div>
+                        </div>
+                        <div class="worker-meta">
+                            <span>任务数: <b>${w.tasks_done || 0}</b></span>
+                            <span>批次: <b>~${batchEst}</b></span>
+                            <span>最后活跃: <b>${formatTime(w.last_seen)}</b></span>
                         </div>
                     </div>
                 `;
@@ -364,36 +472,71 @@
         async function refreshMatches() {
             const data = await fetchAPI('/matches');
             const matches = data.matches || [];
-            const list = document.getElementById('matches-list');
 
+            // 分类：已激活 / 全部
+            const confirmed = matches.filter(m => m.confirmed === true);
+            const allRecent = matches.slice(-20).reverse();
+
+            // 统计
             document.getElementById('match-count').textContent = `${matches.length} 个`;
 
+            // --- 已激活账户栏 ---
+            const confirmedPanel = document.getElementById('confirmed-panel');
+            const confirmedList  = document.getElementById('confirmed-list');
+            if (confirmed.length > 0) {
+                confirmedPanel.style.display = '';
+                document.getElementById('confirmed-count').textContent = `${confirmed.length} 个`;
+                confirmedList.innerHTML = confirmed.map(m => {
+                    const ct = m.create_time > 0
+                        ? new Date(m.create_time).toLocaleString()
+                        : '';
+                    return `
+                        <div class="confirmed-item">
+                            <div class="match-address">🏆 ${m.address}</div>
+                            ${ct ? `<div class="match-create-time">创建时间: ${ct}</div>` : ''}
+                            <div class="match-mnemonic">${m.mnemonic}</div>
+                        </div>`;
+                }).join('');
+            } else {
+                confirmedPanel.style.display = 'none';
+            }
+
+            // --- 全部匹配列表 ---
+            const list = document.getElementById('matches-list');
             if (matches.length === 0) {
                 list.innerHTML = '<div class="empty-state">暂无匹配</div>';
                 return;
             }
 
-            // 只显示最近10条
-            const recent = matches.slice(-10).reverse();
-            list.innerHTML = recent.map(m => `
-                <div class="match-item">
-                    <div class="match-address">${m.address}</div>
-                    <div class="match-mnemonic">${m.mnemonic}</div>
-                </div>
-            `).join('');
+            list.innerHTML = allRecent.map(m => {
+                let badge, badgeClass;
+                if (m.confirm_err) {
+                    badge = '⚠️ 查询失败'; badgeClass = 'badge-error';
+                } else if (m.confirmed === null || m.confirmed === undefined) {
+                    badge = '⏳ 待确认'; badgeClass = 'badge-pending';
+                } else if (m.confirmed === true) {
+                    badge = '✅ 已激活'; badgeClass = 'badge-active';
+                } else {
+                    badge = '⬜ 未激活'; badgeClass = 'badge-inactive';
+                }
+                return `
+                    <div class="match-item">
+                        <div><span class="match-confirm-badge ${badgeClass}">${badge}</span></div>
+                        <div class="match-address">${m.address}</div>
+                        <div class="match-mnemonic">${m.mnemonic}</div>
+                    </div>`;
+            }).join('');
         }
 
         async function createJob() {
             const name = document.getElementById('job-name').value;
             const mnemonic = document.getElementById('mnemonic').value;
-            const batchSize = parseInt(document.getElementById('batch-size').value);
-
             if (!mnemonic) { alert('请输入助记词模板'); return; }
 
             await fetch('/api/jobs', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, mnemonic, batch_size: batchSize })
+                body: JSON.stringify({ name, mnemonic })
             });
 
             document.getElementById('job-name').value = '';
@@ -422,6 +565,16 @@
             refresh();
         }
 
+        function formatDuration(secs) {
+            secs = Math.floor(secs);
+            if (secs < 60) return secs + '秒';
+            const m = Math.floor(secs / 60) % 60;
+            const h = Math.floor(secs / 3600);
+            const s = secs % 60;
+            if (h > 0) return h + '小时' + m + '分';
+            return m + '分' + s + '秒';
+        }
+
         function formatNum(n) {
             if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
             if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
@@ -432,8 +585,7 @@
         function formatTime(t) {
             if (!t) return '-';
             const d = new Date(t);
-            const now = new Date();
-            const diff = (now - d) / 1000;
+            const diff = (Date.now() - d) / 1000;
             if (diff < 60) return Math.floor(diff) + '秒前';
             if (diff < 3600) return Math.floor(diff / 60) + '分前';
             return d.toLocaleTimeString();
@@ -441,7 +593,7 @@
 
         // 启动自动刷新
         refresh();
-        refreshInterval = setInterval(refresh, 2000);
+        setInterval(refresh, 2000);
     </script>
 </body>
 </html>

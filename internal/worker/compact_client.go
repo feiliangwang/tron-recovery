@@ -15,17 +15,15 @@ import (
 type CompactClient struct {
 	baseURL    string
 	httpClient *http.Client
-	batchSize  int64
 }
 
 // NewCompactClient 创建客户端
-func NewCompactClient(baseURL string, batchSize int64) *CompactClient {
+func NewCompactClient(baseURL string) *CompactClient {
 	return &CompactClient{
 		baseURL: baseURL,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		batchSize: batchSize,
 	}
 }
 
@@ -60,15 +58,15 @@ func (c *CompactClient) FetchTemplate(jobID int64) (*TaskTemplate, error) {
 	}, nil
 }
 
-// FetchTask 获取任务
-func (c *CompactClient) FetchTask(workerID string) (*protocol.CompactTask, error) {
+// FetchTask 获取任务，携带当前枚举速度（indices/s），由调度器据此分配合适的枚举空间
+func (c *CompactClient) FetchTask(workerID string, speed int64) (*protocol.CompactTask, error) {
 	url := fmt.Sprintf("%s/api/task/fetch", c.baseURL)
 
-	// 请求体: workerID(len+data) + batchSize(8)
+	// 请求体: [workerIDLen(1)][workerID][speed(8, int64)]
 	buf := new(bytes.Buffer)
 	buf.WriteByte(byte(len(workerID)))
 	buf.WriteString(workerID)
-	binary.Write(buf, binary.BigEndian, c.batchSize)
+	binary.Write(buf, binary.BigEndian, speed)
 
 	resp, err := c.httpClient.Post(url, "application/octet-stream", buf)
 	if err != nil {
@@ -92,7 +90,7 @@ func (c *CompactClient) FetchTask(workerID string) (*protocol.CompactTask, error
 func (c *CompactClient) SubmitResult(workerID string, result *protocol.CompactResult) error {
 	url := fmt.Sprintf("%s/api/task/submit", c.baseURL)
 
-	// 请求体: workerID(len+data) + result
+	// 请求体: [workerIDLen(1)][workerID][result]
 	buf := new(bytes.Buffer)
 	buf.WriteByte(byte(len(workerID)))
 	buf.WriteString(workerID)

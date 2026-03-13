@@ -18,24 +18,24 @@ type SchedulerClient interface {
 
 // Worker 计算节点
 type Worker struct {
-	id           string
-	computer     compute.SeedComputer
-	client       SchedulerClient
+	id       string
+	computer compute.SeedComputer
+	client   SchedulerClient
 
 	pollInterval   time.Duration
 	computeWorkers int
 	prefetchSize   int // 预取任务数量
 
-	taskQueue  chan *protocol.Task
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
+	taskQueue chan *protocol.Task
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
 
 	running int32
 
 	// 统计
 	stats struct {
-		tasksFetched  int64
-		tasksComputed int64
+		tasksFetched   int64
+		tasksComputed  int64
 		tasksSubmitted int64
 	}
 }
@@ -175,12 +175,7 @@ func (w *Worker) processTask(ctx context.Context, task *protocol.Task) {
 	start := time.Now()
 
 	// 计算地址
-	addresses, err := w.computer.Compute(task.Mnemonics)
-	if err != nil {
-		log.Printf("[Worker %s] 计算失败 [task=%d]: %v", w.id, task.ID, err)
-		return
-	}
-
+	addresses := w.computer.Compute(task.Mnemonics)
 	atomic.AddInt64(&w.stats.tasksComputed, 1)
 
 	// 构建结果

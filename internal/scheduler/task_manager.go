@@ -209,6 +209,17 @@ func (tm *TaskManager) SetTotal(id string, total int64) {
 	}
 }
 
+// SetCompleted 设置已完成数（由 worker 提交结果时更新）
+func (tm *TaskManager) SetCompleted(id string, completed int64) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if job, exists := tm.jobs[id]; exists {
+		job.Completed = completed
+		tm.save()
+	}
+}
+
 // load 加载状态
 func (tm *TaskManager) load() error {
 	data, err := os.ReadFile(tm.file)

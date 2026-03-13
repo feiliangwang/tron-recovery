@@ -3,14 +3,14 @@ package protocol
 // Task 任务
 type Task struct {
 	ID        int      `json:"id"`
-	Mnemonics [][]string `json:"mnemonics"`
+	Mnemonics []string `json:"mnemonics"`
 }
 
 // Result 结果
 type Result struct {
-	TaskID    int         `json:"task_id"`
-	Addresses [][]byte    `json:"addresses"` // 20 bytes each
-	Mnemonics [][]string  `json:"mnemonics"` // 原始助记词（用于匹配结果）
+	TaskID    int      `json:"task_id"`
+	Addresses [][]byte `json:"addresses"` // 20 bytes each
+	Mnemonics []string `json:"mnemonics"` // 原始助记词（用于匹配结果）
 }
 
 // TaskRequest 任务请求

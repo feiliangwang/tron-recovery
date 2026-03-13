@@ -68,10 +68,10 @@ func (c *HTTPClient) SubmitResult(workerID string, result *protocol.Result) erro
 
 	// 将 [][]byte 转换为 hex string 数组以便 JSON 序列化
 	type submitRequest struct {
-		WorkerID  string     `json:"worker_id"`
-		TaskID    int        `json:"task_id"`
-		Addresses []string   `json:"addresses"`
-		Mnemonics [][]string `json:"mnemonics"`
+		WorkerID  string   `json:"worker_id"`
+		TaskID    int      `json:"task_id"`
+		Addresses []string `json:"addresses"`
+		Mnemonics []string `json:"mnemonics"`
 	}
 
 	addresses := make([]string, len(result.Addresses))

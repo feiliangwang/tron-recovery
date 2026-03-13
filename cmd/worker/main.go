@@ -19,8 +19,7 @@ var (
 	schedulerURL = flag.String("scheduler", "http://localhost:8080", "调度服务器地址")
 	workerID     = flag.String("id", "", "Worker ID（留空自动生成）")
 	workers      = flag.Int("workers", runtime.NumCPU(), "并发计算线程数")
-	batchSize    = flag.Int64("batch", 10000, "每批次枚举数量")
-	bloomFile    = flag.String("bloom", "", "Bloom过滤器文件（本地加载）")
+	bloomFile    = flag.String("bloom", "account.bin.bloom", "Bloom过滤器文件（本地加载）")
 )
 
 func main() {
@@ -51,12 +50,11 @@ func main() {
 	log.Printf("  ID:           %s", id)
 	log.Printf("  调度服务器:    %s", *schedulerURL)
 	log.Printf("  计算线程:      %d", *workers)
-	log.Printf("  批次大小:      %d", *batchSize)
 	log.Printf("  Bloom过滤:     %s", boolStr(bloomFilter != nil, "已加载", "未加载"))
 	log.Printf("========================================")
 
 	// 创建紧凑协议客户端
-	client := worker.NewCompactClient(*schedulerURL, *batchSize)
+	client := worker.NewCompactClient(*schedulerURL)
 
 	// 创建紧凑Worker
 	w := worker.NewCompactWorker(id, client, *workers)
