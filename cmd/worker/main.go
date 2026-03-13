@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"boon/internal/bloom"
+	"boon/internal/compute"
 	"boon/internal/worker"
 )
 
@@ -20,6 +21,7 @@ var (
 	workerID     = flag.String("id", "", "Worker ID（留空自动生成）")
 	workers      = flag.Int("workers", runtime.NumCPU(), "并发计算线程数")
 	bloomFile    = flag.String("bloom", "account.bin.bloom", "Bloom过滤器文件（本地加载）")
+	useGPU       = flag.Bool("gpu", false, "使用GPU加速（需要CUDA构建）")
 )
 
 func main() {
@@ -51,13 +53,29 @@ func main() {
 	log.Printf("  调度服务器:    %s", *schedulerURL)
 	log.Printf("  计算线程:      %d", *workers)
 	log.Printf("  Bloom过滤:     %s", boolStr(bloomFilter != nil, "已加载", "未加载"))
+	log.Printf("  GPU加速:       %s", boolStr(*useGPU, "启用", "禁用"))
 	log.Printf("========================================")
+
+	// 选择计算引擎
+	var seedComp compute.SeedComputer
+	if *useGPU {
+		gpu, err := compute.NewGPUComputer()
+		if err != nil {
+			log.Printf("GPU初始化失败，回退到CPU: %v", err)
+			seedComp = compute.NewCPUComputer()
+		} else {
+			log.Printf("GPU计算器初始化成功")
+			seedComp = gpu
+		}
+	} else {
+		seedComp = compute.NewCPUComputer()
+	}
 
 	// 创建紧凑协议客户端
 	client := worker.NewCompactClient(*schedulerURL)
 
-	// 创建紧凑Worker
-	w := worker.NewCompactWorker(id, client, *workers)
+	// 创建紧凑Worker（使用所选计算引擎）
+	w := worker.NewCompactWorkerWithComputer(id, client, *workers, seedComp)
 	w.SetBloomFilter(bloomFilter)
 
 	// 处理信号

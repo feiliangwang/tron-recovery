@@ -44,15 +44,20 @@ type CompactWorker struct {
 	}
 }
 
-// NewCompactWorker 创建紧凑Worker
+// NewCompactWorker 创建紧凑Worker（使用CPU计算引擎）
 func NewCompactWorker(id string, client *CompactClient, workers int) *CompactWorker {
+	return NewCompactWorkerWithComputer(id, client, workers, compute.NewCPUComputer())
+}
+
+// NewCompactWorkerWithComputer 创建紧凑Worker（使用指定计算引擎）
+func NewCompactWorkerWithComputer(id string, client *CompactClient, workers int, seedComp compute.SeedComputer) *CompactWorker {
 	return &CompactWorker{
 		id:           id,
 		client:       client,
-		computer:     compute.NewCompactComputer(workers, compute.NewCPUComputer()),
+		computer:     compute.NewCompactComputer(workers, seedComp),
 		pollInterval: 50 * time.Millisecond,
 		workers:      workers,
-		taskQueue:    make(chan *pendingTask, 2), // 1个计算中 + 1个预取
+		taskQueue:    make(chan *pendingTask, 2),
 		stopCh:       make(chan struct{}),
 	}
 }
