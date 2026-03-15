@@ -143,7 +143,7 @@ func runBench(total int, gpu bool, cpuWorkers int) {
 	fmt.Printf("\n计算引擎: %s\n", compName)
 	fmt.Printf("助记词总数: %d\n\n", total)
 
-	batchSizes := []int{64, 128, 256, 512, 1024, 2048}
+	batchSizes := []int{2048, 2048 << 1, 2048 << 2, 2048 << 3, 2048 << 4, 2048 << 5, 2048 << 6, 2048 << 7}
 
 	// 表头
 	fmt.Printf("%-10s  %-12s  %-10s  %-14s\n", "批次大小", "已计算", "耗时", "速度(个/s)")
