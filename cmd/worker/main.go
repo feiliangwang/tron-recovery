@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,23 +18,46 @@ import (
 
 	"boon/internal/bloom"
 	"boon/internal/compute"
+	mn "boon/internal/mnemonic"
 	"boon/internal/protocol"
 	"boon/internal/worker"
 )
 
 var (
-	schedulerURL = flag.String("scheduler", "http://192.168.3.250", "调度服务器地址")
-	workerID     = flag.String("id", "", "Worker ID（留空自动生成）")
-	workers      = flag.Int("workers", runtime.NumCPU(), "并发计算线程数")
-	bloomFile    = flag.String("bloom", "account.bin.bloom", "Bloom过滤器文件（本地加载）")
-	useGPU       = flag.Bool("gpu", false, "使用GPU加速（需要CUDA构建）")
-	benchN       = flag.Int("bench", 0, "测速模式：随机生成N个助记词测算计算速度（0=禁用）")
-	verifyN      = flag.Int("verify", 0, "验证模式：随机生成N个助记词对比GPU与CPU结果（0=禁用）")
-	benchFullN   = flag.Int64("bench-full", 0, "全链路测速：模拟完整枚举→验证→计算流程，扫描N个索引（0=禁用）")
+	schedulerURL  = flag.String("scheduler", "http://192.168.3.250", "调度服务器地址")
+	workerID      = flag.String("id", "", "Worker ID（留空自动生成）")
+	workers       = flag.Int("workers", runtime.NumCPU(), "并发计算线程数")
+	bloomFile     = flag.String("bloom", "account.bin.bloom", "Bloom过滤器文件（本地加载）")
+	useGPU        = flag.Bool("gpu", false, "使用GPU加速（需要CUDA构建）")
+	benchN        = flag.Int("bench", 0, "测速模式：随机生成N个助记词测算计算速度（0=禁用）")
+	verifyN       = flag.Int("verify", 0, "验证模式：随机生成N个助记词对比GPU与CPU结果（0=禁用）")
+	benchFullN    = flag.Int64("bench-full", 0, "全链路测速：模拟完整枚举→验证→计算流程，扫描N个索引（0=禁用）")
+	bloomTestMnem = flag.String("bloom-test", "", "Bloom过滤器验证：给定助记词，对比CPU与GPU bloom结果")
+	enumTestMnem  = flag.String("enum-test", "", "枚举验证：给定完整助记词+模板，验证CPU/GPU索引转换是否正确（配合-template使用）")
+	enumTemplate  = flag.String("template", "", "枚举验证用的模板（未知词用?，如 'word1 ? ? word4 ...'）")
+	bip39DebugMnem = flag.String("bip39-debug", "", "BIP39 GPU调试：验证GPU checksum计算（需要-gpu）")
 )
 
 func main() {
 	flag.Parse()
+
+	// 独立模式：bloom 过滤器验证
+	if *bloomTestMnem != "" {
+		runBloomTest(*bloomTestMnem, *bloomFile)
+		return
+	}
+
+	// 独立模式：BIP39 GPU checksum 调试
+	if *bip39DebugMnem != "" {
+		runBIP39Debug(*bip39DebugMnem)
+		return
+	}
+
+	// 独立模式：枚举验证
+	if *enumTestMnem != "" {
+		runEnumTest(*enumTestMnem, *enumTemplate, *bloomFile)
+		return
+	}
 
 	// 独立模式：测速
 	if *benchN > 0 {
@@ -122,6 +146,9 @@ func main() {
 		log.Printf("收到信号: %v，正在关闭...", sig)
 		cancel()
 	}()
+
+	// 启动前自测速，预填速度窗口，让第一次任务请求即携带准确速度
+	w.Warmup()
 
 	startTime := time.Now()
 	w.Start(ctx)
@@ -398,6 +425,302 @@ func genMnemonics(n int) ([]string, error) {
 		out[i] = mn
 	}
 	return out, nil
+}
+
+// ================================================================
+// Bloom 过滤器验证模式
+// ================================================================
+
+type bloomUploader interface {
+	UploadBloomFilter(f *bloom.Filter) error
+}
+type bloomTester interface {
+	BloomTestAddr(addr []byte) bool
+}
+
+func runBloomTest(mnemonic, bloomFilePath string) {
+	fmt.Printf("=== Bloom 过滤器验证 ===\n")
+	fmt.Printf("助记词: %s\n", mnemonic)
+
+	// 1. CPU 计算地址
+	cpuComp := compute.NewCPUComputer()
+	cpuAddrs := cpuComp.Compute([]string{mnemonic})
+	if len(cpuAddrs) == 0 || len(cpuAddrs[0]) == 0 {
+		log.Fatalf("CPU 计算地址失败")
+	}
+	cpuAddr := cpuAddrs[0]
+	fmt.Printf("CPU 地址:  %s\n", hex.EncodeToString(cpuAddr))
+
+	// 2. GPU 计算地址
+	gpuCompConcrete, err := compute.NewGPUComputer()
+	if err != nil {
+		log.Fatalf("GPU 初始化失败: %v", err)
+	}
+	var gpuComp compute.SeedComputer = gpuCompConcrete
+	gpuAddrs := gpuComp.Compute([]string{mnemonic})
+	if len(gpuAddrs) == 0 || len(gpuAddrs[0]) == 0 {
+		log.Fatalf("GPU 计算地址失败")
+	}
+	gpuAddr := gpuAddrs[0]
+	fmt.Printf("GPU 地址:  %s\n", hex.EncodeToString(gpuAddr))
+
+	if bytes.Equal(cpuAddr, gpuAddr) {
+		fmt.Printf("地址对比:  ✓ CPU == GPU\n")
+	} else {
+		fmt.Printf("地址对比:  ✗ CPU != GPU  ← 地址计算 BUG\n")
+	}
+
+	// 3. 加载 bloom 过滤器
+	bf, err := bloom.LoadFromFile(bloomFilePath)
+	if err != nil {
+		log.Fatalf("加载 bloom 文件失败: %v", err)
+	}
+	fmt.Printf("\nBloom 文件: %s\n", bloomFilePath)
+
+	// 4. CPU bloom 检查
+	cpuBloom := bf.Contains(cpuAddr)
+	fmt.Printf("CPU bloom.Contains(cpu_addr):  %v\n", cpuBloom)
+
+	// 5. 上传 bloom 到 GPU 并测试
+	up, okUp := gpuComp.(bloomUploader)
+	bt, okBt := gpuComp.(bloomTester)
+	if !okUp || !okBt {
+		log.Fatalf("当前构建不支持 GPU bloom 测试（需要 -tags cuda）")
+	}
+	if err := up.UploadBloomFilter(bf); err != nil {
+		log.Fatalf("GPU bloom 上传失败: %v", err)
+	}
+
+	// 6. GPU bloom 测试 CPU 地址
+	gpuBloomCPUAddr := bt.BloomTestAddr(cpuAddr)
+	fmt.Printf("GPU bloom.test(cpu_addr):      %v\n", gpuBloomCPUAddr)
+
+	// 7. GPU bloom 测试 GPU 地址（若地址不同则额外测试）
+	if !bytes.Equal(cpuAddr, gpuAddr) {
+		gpuBloomGPUAddr := bt.BloomTestAddr(gpuAddr)
+		fmt.Printf("GPU bloom.test(gpu_addr):      %v\n", gpuBloomGPUAddr)
+	}
+
+	fmt.Printf("\n=== 诊断 ===\n")
+	switch {
+	case !cpuBloom:
+		fmt.Printf("❌ 地址不在 bloom 过滤器中（CPU），请确认助记词/bloom文件是否匹配\n")
+	case cpuBloom && !gpuBloomCPUAddr:
+		fmt.Printf("❌ GPU bloom hash 与 Go 实现不一致 → GPU bloom 过滤器 BUG\n")
+	case cpuBloom && gpuBloomCPUAddr:
+		fmt.Printf("✓ CPU 和 GPU bloom 均通过，bloom 过滤器实现正确\n")
+		fmt.Printf("  若枚举时仍漏报，问题可能在枚举索引→助记词的转换逻辑\n")
+	}
+}
+
+// ================================================================
+// BIP39 GPU checksum 调试
+// ================================================================
+
+type bip39Debugger interface {
+	BIP39Debug(wordIndices [12]int16) (storedCS, sha0 byte, err error)
+}
+
+func runBIP39Debug(mnemonic string) {
+	fmt.Printf("=== GPU BIP39 Checksum 调试 ===\n")
+	words := strings.Fields(mnemonic)
+	if len(words) != 12 {
+		log.Fatalf("助记词必须是12个词，当前: %d", len(words))
+	}
+	wordToIdx := make(map[string]int)
+	for i, w := range mn.WordList {
+		wordToIdx[w] = i
+	}
+	var wi [12]int16
+	for i, w := range words {
+		idx, ok := wordToIdx[w]
+		if !ok {
+			log.Fatalf("词 '%s' 不在BIP39词表中", w)
+		}
+		wi[i] = int16(idx)
+		fmt.Printf("  wi[%d] = %d (%s)\n", i, idx, w)
+	}
+
+	gpuRaw, err := compute.NewGPUComputer()
+	if err != nil {
+		log.Fatalf("GPU 初始化失败: %v", err)
+	}
+	defer gpuRaw.Close()
+
+	dbg, ok := any(gpuRaw).(bip39Debugger)
+	if !ok {
+		log.Fatalf("当前构建不支持 GPU BIP39 调试")
+	}
+	storedCS, sha0, err := dbg.BIP39Debug(wi)
+	if err != nil {
+		log.Fatalf("BIP39Debug 失败: %v", err)
+	}
+	fmt.Printf("\nGPU stored_cs (bits & 0xF): 0x%X\n", storedCS)
+	fmt.Printf("GPU sha256[0]:              0x%02X\n", sha0)
+	fmt.Printf("GPU sha256[0] >> 4:         0x%X\n", sha0>>4)
+	if storedCS == sha0>>4 {
+		fmt.Printf("✓ GPU checksum 通过\n")
+	} else {
+		fmt.Printf("✗ GPU checksum 不匹配 → BIP39 filter 会拒绝该助记词\n")
+	}
+}
+
+// ================================================================
+// 枚举验证模式
+// ================================================================
+
+type gpuEnumerator interface {
+	EnumerateCompute(startIdx, endIdx int64, knownWordIndices []int16, unknownPositions []int8) ([]int64, [][]byte, error)
+}
+
+func runEnumTest(targetMnemonic, template, bloomFilePath string) {
+	fmt.Printf("=== 枚举验证 ===\n")
+	fmt.Printf("目标助记词: %s\n", targetMnemonic)
+
+	targetWords := strings.Fields(targetMnemonic)
+	if len(targetWords) != 12 {
+		log.Fatalf("助记词必须是12个词，当前: %d", len(targetWords))
+	}
+
+	// 构造模板词数组（? 或空位 = 未知）
+	var tmplWords []string
+	if template == "" {
+		// 默认：最后4个词未知（避免 int64 溢出）
+		tmplWords = make([]string, 12)
+		copy(tmplWords, targetWords[:8])
+		fmt.Printf("模板: 未指定，默认前8个词已知，后4个词未知\n")
+	} else {
+		tmplWords = strings.Fields(template)
+		if len(tmplWords) != 12 {
+			log.Fatalf("模板必须是12个词，当前: %d", len(tmplWords))
+		}
+		for i, w := range tmplWords {
+			if w == "?" {
+				tmplWords[i] = ""
+			}
+		}
+		fmt.Printf("模板: %s\n", template)
+	}
+
+	// 确认已知词匹配，收集未知位置
+	unknownPos := make([]int, 0)
+	for i, w := range tmplWords {
+		if w == "" {
+			unknownPos = append(unknownPos, i)
+		} else if w != targetWords[i] {
+			log.Fatalf("模板第%d位词'%s'与目标词'%s'不匹配", i, w, targetWords[i])
+		}
+	}
+	fmt.Printf("未知位置: %v (%d个)\n", unknownPos, len(unknownPos))
+
+	// 检测溢出：未知词数超过6个时 2048^n > int64_max
+	if len(unknownPos) > 6 {
+		log.Fatalf("未知词数 %d 超过6个，枚举索引会溢出 int64。\n请用 -template 指定更多已知词，例如：\n  -template \"%s ? ? ? ?\"",
+			len(unknownPos), strings.Join(targetWords[:8], " "))
+	}
+
+	// 计算目标助记词的枚举索引
+	wordToIdx := make(map[string]int)
+	for i, w := range mn.WordList {
+		wordToIdx[w] = i
+	}
+	var targetIdx int64
+	var multiplier int64 = 1
+	for _, pos := range unknownPos {
+		wi, ok := wordToIdx[targetWords[pos]]
+		if !ok {
+			log.Fatalf("词 '%s' 不在BIP39词表中", targetWords[pos])
+		}
+		targetIdx += int64(wi) * multiplier
+		multiplier *= 2048
+	}
+	fmt.Printf("目标枚举索引: %d\n\n", targetIdx)
+
+	// CPU EnumerateAt 验证
+	tmpl := &worker.TaskTemplate{
+		JobID:      0,
+		Words:      tmplWords,
+		UnknownPos: unknownPos,
+	}
+	enum := worker.NewLocalEnumerator(tmpl)
+	validator := mn.NewValidator()
+	cpuWords, valid := enum.EnumerateAt(targetIdx, validator)
+	fmt.Printf("CPU EnumerateAt(%d):\n", targetIdx)
+	if !valid {
+		fmt.Printf("  ✗ BIP39 校验失败（checksum 无效）\n")
+		cpuWords = targetWords
+	} else if strings.Join(cpuWords, " ") == targetMnemonic {
+		fmt.Printf("  ✓ 正确还原: %s\n", strings.Join(cpuWords, " "))
+	} else {
+		fmt.Printf("  ✗ 还原错误:\n    得到: %s\n    期望: %s\n", strings.Join(cpuWords, " "), targetMnemonic)
+	}
+
+	cpuComp := compute.NewCPUComputer()
+	cpuAddr := cpuComp.Compute([]string{strings.Join(cpuWords, " ")})[0]
+	fmt.Printf("  CPU 地址: %s\n\n", hex.EncodeToString(cpuAddr))
+
+	// GPU 枚举（通过接口断言访问 EnumerateCompute）
+	gpuRaw, err := compute.NewGPUComputer()
+	if err != nil {
+		log.Fatalf("GPU 初始化失败: %v", err)
+	}
+	var gpuSeed compute.SeedComputer = gpuRaw
+	ge, okGE := gpuSeed.(gpuEnumerator)
+	if !okGE {
+		log.Fatalf("当前构建不支持 GPU 枚举（需要 -tags cuda）")
+	}
+
+	knownWordIndices, unknownPositions := enum.TemplateIndices()
+
+	fmt.Printf("GPU EnumerateCompute([%d, %d)) 无bloom:\n", targetIdx, targetIdx+1)
+	idxs, addrs, err := ge.EnumerateCompute(targetIdx, targetIdx+1, knownWordIndices, unknownPositions)
+	if err != nil {
+		fmt.Printf("  ✗ GPU 枚举出错: %v\n", err)
+	} else if len(idxs) == 0 {
+		fmt.Printf("  ✗ 未返回结果 → GPU BIP39 checksum 将该助记词过滤掉了\n")
+	} else {
+		gpuAddr := addrs[0]
+		fmt.Printf("  GPU 地址: %s  (idx=%d)\n", hex.EncodeToString(gpuAddr), idxs[0])
+		if bytes.Equal(cpuAddr, gpuAddr) {
+			fmt.Printf("  ✓ CPU == GPU\n")
+		} else {
+			fmt.Printf("  ✗ CPU != GPU ← GPU 推导 BUG\n")
+		}
+	}
+
+	if bloomFilePath == "" {
+		return
+	}
+	bf, err := bloom.LoadFromFile(bloomFilePath)
+	if err != nil {
+		fmt.Printf("\n加载 bloom 失败: %v\n", err)
+		return
+	}
+	up, okUp := gpuSeed.(bloomUploader)
+	if !okUp {
+		return
+	}
+	if err := up.UploadBloomFilter(bf); err != nil {
+		fmt.Printf("\nGPU bloom 上传失败: %v\n", err)
+		return
+	}
+
+	fmt.Printf("\nGPU EnumerateCompute([%d, %d)) + bloom:\n", targetIdx, targetIdx+1)
+	idxsB, addrsB, err := ge.EnumerateCompute(targetIdx, targetIdx+1, knownWordIndices, unknownPositions)
+	if err != nil {
+		fmt.Printf("  ✗ GPU 枚举出错: %v\n", err)
+	} else if len(idxsB) == 0 {
+		cpuBloom := bf.Contains(cpuAddr)
+		fmt.Printf("  ✗ GPU bloom 过滤掉了该地址\n")
+		fmt.Printf("  CPU bloom.Contains: %v\n", cpuBloom)
+		if cpuBloom {
+			fmt.Printf("  → GPU bloom hash 实现 BUG\n")
+		} else {
+			fmt.Printf("  → 地址不在 bloom 中（bloom 文件不包含该地址）\n")
+		}
+	} else {
+		fmt.Printf("  ✓ bloom 通过: %s\n", hex.EncodeToString(addrsB[0]))
+	}
 }
 
 func fmtDuration(d time.Duration) string {

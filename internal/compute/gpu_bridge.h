@@ -64,8 +64,19 @@ int gpu_bloom_upload(const uint64_t *words, uint64_t word_count, uint64_t m, uin
 /* Release GPU bloom filter memory */
 void gpu_bloom_free(void);
 
+/*
+ * Test a single 20-byte address against the currently-uploaded GPU bloom filter.
+ * Returns 1 if (possibly) present, 0 if definitely absent, -1 if no filter loaded.
+ */
+int gpu_bloom_test_addr(const uint8_t *addr20);
+
 /* Release all persistent GPU enumerate buffers (call on shutdown) */
 void gpu_enumerate_cleanup(void);
+
+/* Debug: run BIP39 checksum for a single 12-word set on GPU.
+ * Returns stored_cs (low 4 bits of packed bits) and sha0 (SHA256(entropy)[0]).
+ * Pass: (sha0>>4) == stored_cs. Returns 0 on success, -1 on CUDA error. */
+int gpu_bip39_debug(const int16_t wi[12], uint8_t *stored_cs_out, uint8_t *sha0_out);
 
 #ifdef __cplusplus
 }

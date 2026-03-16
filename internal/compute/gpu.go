@@ -154,6 +154,34 @@ func (g *GPUComputer) UploadBloomFilter(f *bloom.Filter) error {
 	return nil
 }
 
+// BloomTestAddr tests a 20-byte address against the currently-uploaded GPU bloom filter.
+// Returns true if present, false if absent. Panics if no filter is loaded.
+func (g *GPUComputer) BloomTestAddr(addr []byte) bool {
+	if len(addr) != 20 {
+		panic("BloomTestAddr: address must be 20 bytes")
+	}
+	ret := C.gpu_bloom_test_addr((*C.uint8_t)(unsafe.Pointer(&addr[0])))
+	return int(ret) == 1
+}
+
+// BIP39Debug runs the BIP39 checksum validation for a single 12-word set on GPU.
+// Returns (stored_cs, sha0, err). Pass condition: sha0>>4 == stored_cs.
+func (g *GPUComputer) BIP39Debug(wordIndices [12]int16) (storedCS, sha0 byte, err error) {
+	wiC := make([]C.int16_t, 12)
+	for i, v := range wordIndices {
+		wiC[i] = C.int16_t(v)
+	}
+	var cStored, cSha C.uint8_t
+	ret := C.gpu_bip39_debug(
+		(*C.int16_t)(unsafe.Pointer(&wiC[0])),
+		&cStored, &cSha,
+	)
+	if int(ret) < 0 {
+		return 0, 0, fmt.Errorf("gpu_bip39_debug failed")
+	}
+	return byte(cStored), byte(cSha), nil
+}
+
 // Close 关闭GPU计算器，释放持久化GPU内存
 func (g *GPUComputer) Close() error {
 	C.gpu_enumerate_cleanup()

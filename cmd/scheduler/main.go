@@ -37,12 +37,14 @@ type pendingTaskRecord struct {
 	jobID    string
 	startIdx int64
 	endIdx   int64
+	fetchedAt time.Time // 任务分发时间，用于计算实际计算耗时
 }
 
 // jobSpeedEntry 任务速度滑动窗口条目
 type jobSpeedEntry struct {
-	t       time.Time
-	indices int64
+	t        time.Time
+	indices  int64
+	duration time.Duration // worker 实际计算耗时（submitTime - fetchTime）
 }
 
 // Server 服务器
@@ -59,8 +61,9 @@ type Server struct {
 	matches   []*Match
 	matchesMu sync.Mutex
 
-	workers   map[string]*WorkerInfo
-	workersMu sync.RWMutex
+	workers            map[string]*WorkerInfo
+	workersMu          sync.RWMutex
+	activeWorkerCount  int // 当前在线 worker 数，变化时重置 job 速度窗口
 
 	tronClient *tron.Client // TRON HTTP API 客户端，用于确认账户状态
 }
@@ -249,19 +252,22 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 					v.ElapsedSeconds = int64(now.Sub(*job.StartedAt).Seconds())
 				}
 
-				// 速度 & ETA：1分钟滑动窗口
+				// 速度 & ETA：总索引 / 总实际计算耗时（消除批次波动）
 				if snap.running && len(snap.speedWindow) > 0 {
 					cutoff := now.Add(-60 * time.Second)
-					var total int64
+					var totalIdx, totalDurNs int64
 					for _, e := range snap.speedWindow {
 						if !e.t.Before(cutoff) {
-							total += e.indices
+							totalIdx += e.indices
+							totalDurNs += int64(e.duration)
 						}
 					}
-					v.Speed = total / 60
-					if v.Speed > 0 {
-						remaining := snap.totalIdx - snap.completedIdx
-						v.ETASeconds = remaining / v.Speed
+					if totalDurNs > 0 {
+						v.Speed = int64(float64(totalIdx) / float64(totalDurNs) * 1e9)
+						if v.Speed > 0 {
+							remaining := snap.totalIdx - snap.completedIdx
+							v.ETASeconds = remaining / v.Speed
+						}
 					}
 				}
 			} else if job.StartedAt != nil {
@@ -468,9 +474,12 @@ func (s *Server) handleTaskFetch(w http.ResponseWriter, r *http.Request) {
 		batchSize = maxBatchSize
 	}
 
-	// 更新Worker（记录速度）
+	// 更新Worker（记录速度）；检测新 worker 上线或离线 worker 重连
 	s.workersMu.Lock()
+	wasNew := false
 	if info, exists := s.workers[workerID]; exists {
+		// 若上次活跃超过60s，视为重连
+		wasNew = time.Since(info.LastSeen) > 60*time.Second
 		info.LastSeen = time.Now()
 		info.Speed = speed
 	} else {
@@ -479,8 +488,21 @@ func (s *Server) handleTaskFetch(w http.ResponseWriter, r *http.Request) {
 			LastSeen: time.Now(),
 			Speed:    speed,
 		}
+		wasNew = true
 	}
+	newCount := len(s.workers)
 	s.workersMu.Unlock()
+
+	// 新 worker 加入：更新计数并重置速度窗口
+	if wasNew {
+		s.jobsMu.Lock()
+		if newCount != s.activeWorkerCount {
+			log.Printf("[Scheduler] 新 Worker 上线: %s，在线数: %d → %d，重置速度窗口", workerID, s.activeWorkerCount, newCount)
+			s.activeWorkerCount = newCount
+			s.resetJobSpeedWindowsLocked()
+		}
+		s.jobsMu.Unlock()
+	}
 
 	// 分配任务
 	s.jobsMu.Lock()
@@ -511,7 +533,7 @@ func (s *Server) handleTaskFetch(w http.ResponseWriter, r *http.Request) {
 
 		// 记录待确认任务（含区间信息，用于计算连续完成前沿）
 		s.pendingTasksMu.Lock()
-		s.pendingTasks[task.TaskID] = pendingTaskRecord{jobID: jobID, startIdx: start, endIdx: end}
+		s.pendingTasks[task.TaskID] = pendingTaskRecord{jobID: jobID, startIdx: start, endIdx: end, fetchedAt: time.Now()}
 		s.pendingTasksMu.Unlock()
 
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -578,14 +600,18 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 			if jobID == rec.jobID {
 				indices := rec.endIdx - rec.startIdx
 				runner.CompletedIdx += indices
-				// 记录到1分钟滑动窗口
+				// 记录到1分钟滑动窗口（使用实际计算耗时，消除批次提交造成的波动）
 				now := time.Now()
+				taskDur := now.Sub(rec.fetchedAt)
+				if taskDur <= 0 {
+					taskDur = time.Millisecond
+				}
 				cutoff := now.Add(-60 * time.Second)
 				i := 0
 				for i < len(runner.speedWindow) && runner.speedWindow[i].t.Before(cutoff) {
 					i++
 				}
-				runner.speedWindow = append(runner.speedWindow[i:], jobSpeedEntry{t: now, indices: indices})
+				runner.speedWindow = append(runner.speedWindow[i:], jobSpeedEntry{t: now, indices: indices, duration: taskDur})
 				// 安全重启点：若本 job 还有飞行中任务，取最小 StartIdx；否则取 CurrentIdx
 				if minPending, ok := committedByJob[jobID]; ok {
 					runner.CommittedIdx = minPending
@@ -801,17 +827,34 @@ func (s *Server) restoreJobs() {
 	}
 }
 
-// cleanWorkers 清理Worker
+// cleanWorkers 清理Worker，并在在线数量变化时重置 job 速度窗口
 func (s *Server) cleanWorkers() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	for range ticker.C {
+		cutoff := time.Now().Add(-60 * time.Second)
 		s.workersMu.Lock()
 		for id, w := range s.workers {
-			if time.Since(w.LastSeen) > 60*time.Second {
+			if w.LastSeen.Before(cutoff) {
 				delete(s.workers, id)
 			}
 		}
+		newCount := len(s.workers)
 		s.workersMu.Unlock()
+
+		s.jobsMu.Lock()
+		if newCount != s.activeWorkerCount {
+			log.Printf("[Scheduler] 在线 Worker 数变化: %d → %d，重置速度窗口", s.activeWorkerCount, newCount)
+			s.activeWorkerCount = newCount
+			s.resetJobSpeedWindowsLocked()
+		}
+		s.jobsMu.Unlock()
+	}
+}
+
+// resetJobSpeedWindowsLocked 清空所有 job 的速度窗口（调用前须持有 jobsMu 写锁）
+func (s *Server) resetJobSpeedWindowsLocked() {
+	for _, runner := range s.jobs {
+		runner.speedWindow = runner.speedWindow[:0]
 	}
 }
 

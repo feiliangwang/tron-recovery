@@ -646,7 +646,11 @@ __global__ void bip39_filter_kernel(
             if (eb < 16) entropy[eb++] = (uint8_t)(bits >> bc);
         }
     }
-    uint8_t stored_cs = (uint8_t)((bits << (8 - bc)) >> 4);
+    /* Extract stored checksum: remaining bc bits in low bits of `bits`.
+     * For 12 words: bc=4 always. Must use uint8_t shift to avoid 32-bit
+     * carry masking out the low nibble (e.g. bits=0x...C3 with bc=4 →
+     * (uint32_t shift) gives 0xC3, but correct cs = bits & 0xF = 0x3). */
+    uint8_t stored_cs = (uint8_t)(bits & 0xF);
 
     /* BIP39 checksum validation – early exit for ~93.8% of threads */
     uint8_t sha_out[32];
@@ -898,6 +902,87 @@ void gpu_bloom_free(void)
 {
     if (g_d_bloom) { cudaFree(g_d_bloom); g_d_bloom = NULL; }
     g_bloom_m = 0; g_bloom_k = 0;
+}
+
+/* Kernel: test a single address against GPU bloom filter */
+__global__ void bloom_test_kernel(const uint8_t *addr, int *result,
+    const uint64_t *bits, uint64_t m, uint32_t k)
+{
+    *result = bloom_test(addr, bits, m, k);
+}
+
+/* Test a 20-byte address against the currently-uploaded GPU bloom filter.
+ * Returns 1 if present, 0 if absent, -1 if no filter loaded. */
+int gpu_bloom_test_addr(const uint8_t *addr20)
+{
+    if (!g_d_bloom) return -1;
+
+    uint8_t *d_addr = NULL;
+    int     *d_result = NULL;
+    int      h_result = 0;
+
+    if (cudaMalloc(&d_addr,   20)          != cudaSuccess) return -1;
+    if (cudaMalloc(&d_result, sizeof(int)) != cudaSuccess) {
+        cudaFree(d_addr); return -1;
+    }
+    cudaMemcpy(d_addr, addr20, 20, cudaMemcpyHostToDevice);
+    cudaMemset(d_result, 0, sizeof(int));
+
+    bloom_test_kernel<<<1, 1>>>(d_addr, d_result, g_d_bloom, g_bloom_m, g_bloom_k);
+    cudaDeviceSynchronize();
+    cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_addr);
+    cudaFree(d_result);
+    return h_result;
+}
+
+/* Debug kernel: run BIP39 checksum check on a single word set and return
+ * stored_cs and sha_out[0] so the host can inspect what the GPU computed. */
+__global__ void bip39_debug_kernel(const int16_t *wi_in, uint8_t *out_stored, uint8_t *out_sha)
+{
+    int16_t wi[12];
+    for (int i = 0; i < 12; i++) wi[i] = wi_in[i];
+
+    uint32_t bits = 0;
+    int      bc   = 0;
+    uint8_t  entropy[16];
+    int      eb   = 0;
+    for (int i = 0; i < 12; i++) {
+        bits = (bits << 11) | ((uint32_t)wi[i] & 0x7FFu);
+        bc += 11;
+        while (bc >= 8) {
+            bc -= 8;
+            if (eb < 16) entropy[eb++] = (uint8_t)(bits >> bc);
+        }
+    }
+    /* Same checksum extraction as bip39_filter_kernel */
+    *out_stored = (uint8_t)(bits & 0xF);
+
+    uint8_t sha_out[32];
+    en_sha256_16(entropy, sha_out);
+    *out_sha = sha_out[0];
+
+    /* Also write entropy bytes for inspection */
+    /* (re-using out_sha as entropy[0] is enough; caller checks sha[0]>>4) */
+}
+
+int gpu_bip39_debug(const int16_t wi[12], uint8_t *stored_cs_out, uint8_t *sha0_out)
+{
+    int16_t *d_wi = NULL;
+    uint8_t *d_stored = NULL, *d_sha = NULL;
+    if (cudaMalloc(&d_wi,     12 * sizeof(int16_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&d_stored, 1)                    != cudaSuccess) { cudaFree(d_wi); return -1; }
+    if (cudaMalloc(&d_sha,    1)                    != cudaSuccess) { cudaFree(d_wi); cudaFree(d_stored); return -1; }
+
+    cudaMemcpy(d_wi, wi, 12 * sizeof(int16_t), cudaMemcpyHostToDevice);
+    bip39_debug_kernel<<<1, 1>>>(d_wi, d_stored, d_sha);
+    cudaDeviceSynchronize();
+    cudaMemcpy(stored_cs_out, d_stored, 1, cudaMemcpyDeviceToHost);
+    cudaMemcpy(sha0_out,      d_sha,    1, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_wi); cudaFree(d_stored); cudaFree(d_sha);
+    return 0;
 }
 
 /* Release all persistent GPU buffers (call on shutdown) */

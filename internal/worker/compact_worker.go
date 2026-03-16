@@ -14,8 +14,9 @@ import (
 
 // speedEntry 速度滑动窗口条目
 type speedEntry struct {
-	t       time.Time
-	indices int64
+	t        time.Time     // 任务提交时间（用于窗口裁剪）
+	indices  int64
+	duration time.Duration // 实际计算耗时
 }
 
 // pendingTask 带模板的待处理任务（每次从服务器获取，不在本地存储）
@@ -100,7 +101,7 @@ func (w *CompactWorker) SetBatchSize(n int64) {
 }
 
 // recordSpeed 记录一次任务提交，更新1分钟滑动窗口
-func (w *CompactWorker) recordSpeed(indices int64) {
+func (w *CompactWorker) recordSpeed(indices int64, elapsed time.Duration) {
 	now := time.Now()
 	cutoff := now.Add(-60 * time.Second)
 	w.speedMu.Lock()
@@ -109,10 +110,10 @@ func (w *CompactWorker) recordSpeed(indices int64) {
 	for i < len(w.speedWindow) && w.speedWindow[i].t.Before(cutoff) {
 		i++
 	}
-	w.speedWindow = append(w.speedWindow[i:], speedEntry{t: now, indices: indices})
+	w.speedWindow = append(w.speedWindow[i:], speedEntry{t: now, indices: indices, duration: elapsed})
 }
 
-// getSpeed 返回1分钟窗口内的平均速度（indices/s）
+// getSpeed 返回滑动窗口内的平均速度（indices/s）= 总索引 / 总实际计算耗时
 func (w *CompactWorker) getSpeed() int64 {
 	now := time.Now()
 	cutoff := now.Add(-60 * time.Second)
@@ -123,14 +124,37 @@ func (w *CompactWorker) getSpeed() int64 {
 		i++
 	}
 	w.speedWindow = w.speedWindow[i:]
-	if len(w.speedWindow) == 0 {
+	var totalIdx, totalDurNs int64
+	for _, e := range w.speedWindow {
+		totalIdx += e.indices
+		totalDurNs += int64(e.duration)
+	}
+	if totalDurNs <= 0 {
 		return 0
 	}
-	var total int64
-	for _, e := range w.speedWindow {
-		total += e.indices
+	return int64(float64(totalIdx) / float64(totalDurNs) * 1e9)
+}
+
+// Warmup 启动前自测速：用固定模板跑一批，预填速度窗口，避免冷启动时分到过小的批次
+func (w *CompactWorker) Warmup() {
+	tmpl := &TaskTemplate{
+		JobID:      0,
+		Words:      []string{"abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "", "", "", ""},
+		UnknownPos: []int{8, 9, 10, 11},
 	}
-	return total / 60
+	benchSize := int64(65536)
+	task := &protocol.CompactTask{TaskID: 0, JobID: 0, StartIdx: 0, EndIdx: benchSize}
+	enum := NewLocalEnumerator(tmpl)
+
+	log.Printf("[Worker %s] 自测速中...", w.id)
+	start := time.Now()
+	w.computer.ComputeRange(enum, task, nil)
+	elapsed := time.Since(start)
+
+	if elapsed > 0 {
+		w.recordSpeed(benchSize, elapsed)
+		log.Printf("[Worker %s] 自测速: %d/s (%.2fs)", w.id, w.getSpeed(), elapsed.Seconds())
+	}
 }
 
 // SetEnumWorkers 设置枚举并发数（>1 时启用流水线：多CPU枚举→单GPU计算）
@@ -278,8 +302,8 @@ func (w *CompactWorker) processTask(ctx context.Context, pt *pendingTask) {
 		err := w.client.SubmitResult(w.id, result)
 		if err == nil {
 			atomic.AddInt64(&w.stats.matchesFound, int64(len(result.Matches)))
-			// 提交成功后记录速度（按提交时间，1分钟滑动窗口）
-			w.recordSpeed(indices)
+			// 提交成功后记录速度（按实际计算耗时，1分钟滑动窗口）
+			w.recordSpeed(indices, elapsed)
 			rate := float64(indices) / elapsed.Seconds()
 			if len(result.Matches) > 0 {
 				log.Printf("[Worker %s] 匹配! task=%d matches=%d 速率=%.0f/s",
