@@ -12,6 +12,8 @@ import "C"
 import (
 	"fmt"
 	"unsafe"
+
+	"boon/internal/bloom"
 )
 
 // GPUComputer GPU计算器（CUDA版本）
@@ -132,5 +134,28 @@ func (g *GPUComputer) EnumerateCompute(
 	return outIdxs[:cnt], addresses, nil
 }
 
-// Close 关闭GPU计算器
-func (g *GPUComputer) Close() error { return nil }
+// UploadBloomFilter uploads a bloom filter to persistent GPU memory.
+// Once uploaded, gpu_enumerate_compute will filter addresses on the GPU,
+// returning only bloom-matching results and eliminating GPU→CPU address transfer.
+func (g *GPUComputer) UploadBloomFilter(f *bloom.Filter) error {
+	words, m, k := f.RawBits()
+	if len(words) == 0 {
+		return nil
+	}
+	ret := C.gpu_bloom_upload(
+		(*C.uint64_t)(unsafe.Pointer(&words[0])),
+		C.uint64_t(len(words)),
+		C.uint64_t(m),
+		C.uint32_t(k),
+	)
+	if int(ret) < 0 {
+		return fmt.Errorf("gpu_bloom_upload failed")
+	}
+	return nil
+}
+
+// Close 关闭GPU计算器，释放持久化GPU内存
+func (g *GPUComputer) Close() error {
+	C.gpu_enumerate_cleanup()
+	return nil
+}

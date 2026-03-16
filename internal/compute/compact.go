@@ -53,6 +53,11 @@ func (c *CompactComputer) SetEnumWorkers(n int) {
 	}
 }
 
+// GetSeedComputer 返回底层 SeedComputer（供外层检查是否支持 GPU bloom 上传等接口）
+func (c *CompactComputer) GetSeedComputer() SeedComputer {
+	return c.computer
+}
+
 // enumBatch 枚举结果批次
 type enumBatch struct {
 	mnemonics []string

@@ -67,3 +67,9 @@ func (f *Filter) TestAndAdd(data []byte) bool {
 func (f *Filter) Clear() {
 	f.filter.ClearAll()
 }
+
+// RawBits returns the underlying bit words, total bit count m, and hash count k.
+// Used to upload the filter to GPU memory.
+func (f *Filter) RawBits() (words []uint64, m uint, k uint) {
+	return f.filter.BitSet().Bytes(), f.filter.Cap(), f.filter.K()
+}

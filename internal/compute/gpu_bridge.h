@@ -51,6 +51,22 @@ int gpu_enumerate_compute(
     int           *out_count
 );
 
+/*
+ * Upload a bloom filter to persistent GPU memory.
+ * words      : raw uint64 bitset words (BloomFilter.BitSet().Bytes())
+ * word_count : number of uint64 words
+ * m          : total bits (BloomFilter.Cap())
+ * k          : number of hash functions (BloomFilter.K())
+ * Returns 0 on success, -1 on CUDA error.
+ */
+int gpu_bloom_upload(const uint64_t *words, uint64_t word_count, uint64_t m, uint32_t k);
+
+/* Release GPU bloom filter memory */
+void gpu_bloom_free(void);
+
+/* Release all persistent GPU enumerate buffers (call on shutdown) */
+void gpu_enumerate_cleanup(void);
+
 #ifdef __cplusplus
 }
 #endif

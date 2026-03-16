@@ -62,9 +62,27 @@ func NewCompactWorkerWithComputer(id string, client *CompactClient, workers int,
 	}
 }
 
-// SetBloomFilter 设置Bloom过滤器
+// SetBloomFilter 设置Bloom过滤器；如果计算引擎支持 GPU 上传则同步上传到 GPU 显存
 func (w *CompactWorker) SetBloomFilter(filter *bloom.Filter) {
 	w.bloomFilter = filter
+	if filter == nil {
+		return
+	}
+	// If the underlying computer supports GPU bloom upload, do it now.
+	// This eliminates GPU→CPU address transfer for non-matching addresses.
+	type bloomUploader interface {
+		UploadBloomFilter(f *bloom.Filter) error
+	}
+	if up, ok := w.computer.GetSeedComputer().(bloomUploader); ok {
+		if err := up.UploadBloomFilter(filter); err != nil {
+			log.Printf("[Worker] GPU bloom upload failed (falling back to CPU filter): %v", err)
+		} else {
+			log.Printf("[Worker] Bloom filter uploaded to GPU (%d bits)", func() uint {
+				_, m, _ := filter.RawBits()
+				return m
+			}())
+		}
+	}
 }
 
 // SetBatchSize 设置 GPU/CPU 每次 Compute 调用的批次大小

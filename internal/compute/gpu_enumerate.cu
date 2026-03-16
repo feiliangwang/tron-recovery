@@ -487,6 +487,85 @@ __device__ __noinline__ void en_sha256_16(const uint8_t in[16], uint8_t out[32])
 }
 
 /* ================================================================
+ * MurmurHash3-128 for 20-byte input (TRON address)
+ * Identical to bits-and-blooms/bloom/v3 baseHashes() output.
+ * ================================================================ */
+#define BL_C1 0x87c37b91114253d5ULL
+#define BL_C2 0x4cf5ad432745937fULL
+
+__device__ __forceinline__ uint64_t bl_rotl64(uint64_t x, int r){
+    return (x << r) | (x >> (64 - r));
+}
+__device__ __forceinline__ uint64_t bl_fmix64(uint64_t k){
+    k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33; return k;
+}
+
+/* Load 8 bytes as little-endian uint64 */
+__device__ __forceinline__ uint64_t bl_le64(const uint8_t *p){
+    uint64_t v; memcpy(&v, p, 8); return v;  /* GPU is LE */
+}
+
+/* Returns four 64-bit hash values matching Go sum256() for 20-byte data */
+__device__ void bloom_hash20(const uint8_t *data,
+    uint64_t *h1, uint64_t *h2, uint64_t *h3, uint64_t *h4)
+{
+    uint64_t a1 = 0, a2 = 0;
+
+    /* One full 16-byte block */
+    uint64_t k1 = bl_le64(data),  k2 = bl_le64(data + 8);
+    k1 *= BL_C1; k1 = bl_rotl64(k1, 31); k1 *= BL_C2; a1 ^= k1;
+    a1 = bl_rotl64(a1, 27); a1 += a2; a1 = a1 * 5 + 0x52dce729ULL;
+    k2 *= BL_C2; k2 = bl_rotl64(k2, 33); k2 *= BL_C1; a2 ^= k2;
+    a2 = bl_rotl64(a2, 31); a2 += a1; a2 = a2 * 5 + 0x38495ab5ULL;
+
+    /* 4-byte tail (bytes 16-19) */
+    uint64_t tk1 =  ((uint64_t)data[19] << 24) | ((uint64_t)data[18] << 16)
+                  | ((uint64_t)data[17] <<  8) |  (uint64_t)data[16];
+
+    /* sum128(pad_tail=false, length=20, tail[0..3]) */
+    {
+        uint64_t t1 = a1, t2 = a2, p1 = tk1;
+        p1 *= BL_C1; p1 = bl_rotl64(p1, 31); p1 *= BL_C2; t1 ^= p1;
+        t1 ^= 20ULL; t2 ^= 20ULL;
+        t1 += t2; t2 += t1;
+        t1 = bl_fmix64(t1); t2 = bl_fmix64(t2);
+        t1 += t2; t2 += t1;
+        *h1 = t1; *h2 = t2;
+    }
+
+    /* sum128(pad_tail=true, length=21, tail[0..3])
+     * pad_tail case 5: virtual extra byte at position 4 → k1 ^= (1<<32)    */
+    {
+        uint64_t t1 = a1, t2 = a2, p1 = tk1 | ((uint64_t)1 << 32);
+        p1 *= BL_C1; p1 = bl_rotl64(p1, 31); p1 *= BL_C2; t1 ^= p1;
+        t1 ^= 21ULL; t2 ^= 21ULL;
+        t1 += t2; t2 += t1;
+        t1 = bl_fmix64(t1); t2 = bl_fmix64(t2);
+        t1 += t2; t2 += t1;
+        *h3 = t1; *h4 = t2;
+    }
+}
+
+/* Test a 20-byte address against the bloom filter.
+ * Returns 1 if (possibly) present, 0 if definitely absent. */
+__device__ int bloom_test(const uint8_t *addr,
+    const uint64_t *bits, uint64_t m, uint32_t k)
+{
+    uint64_t h1, h2, h3, h4;
+    bloom_hash20(addr, &h1, &h2, &h3, &h4);
+    uint64_t h[4] = {h1, h2, h3, h4};
+    for (uint32_t i = 0; i < k; i++) {
+        uint64_t ii  = (uint64_t)i;
+        uint64_t loc = h[ii & 1] + ii * h[2 + (((ii + (ii & 1)) & 3) >> 1)];
+        uint64_t bit = loc % m;
+        if (!((bits[bit >> 6] >> (bit & 63)) & 1)) return 0;
+    }
+    return 1;
+}
+
+/* ================================================================
  * Kernel 1: BIP39 filter – lightweight, no TRON derivation.
  * 256 threads/block, small stack (~1 KB/thread).
  * Outputs a compact array of valid word-index sets + original indices.
@@ -548,13 +627,21 @@ __global__ void bip39_filter_kernel(
  * Kernel 2: TRON derive – heavy, operates only on BIP39-valid mnemonics.
  * 32 threads/block, requires cudaLimitStackSize = 65536.
  * 100% thread utilisation – no warp divergence.
+ *
+ * When bloom_bits != NULL, only bloom-passing addresses are written
+ * via atomicAdd(out_count).  When NULL, all results are written and
+ * out_count is unused (caller sets *out_count = count before launch).
  * ================================================================ */
 __global__ void tron_derive_kernel(
-    const int16_t *wi_buf,      /* [count * 12] from kernel 1 */
-    const int64_t *idx_buf,     /* [count]       from kernel 1 */
-    int            count,
-    uint8_t       *out_addrs,   /* [count * 20] */
-    int64_t       *out_indices) /* [count]      */
+    const int16_t  *wi_buf,       /* [count * 12] from kernel 1 */
+    const int64_t  *idx_buf,      /* [count]       from kernel 1 */
+    int             count,
+    uint8_t        *out_addrs,    /* [count * 20] output */
+    int64_t        *out_indices,  /* [count]      output */
+    int            *out_count,    /* atomicAdd counter (bloom mode) */
+    const uint64_t *bloom_bits,   /* GPU bloom bitset (NULL = disabled) */
+    uint64_t        bloom_m,
+    uint32_t        bloom_k)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= count) return;
@@ -585,13 +672,75 @@ __global__ void tron_derive_kernel(
     uint8_t khash[32];
     en_keccak256(pub, 64, khash);
 
-    /* Store result */
-    out_indices[tid] = idx_buf[tid];
-    memcpy(out_addrs + (int64_t)tid * 20, khash + 12, 20);
+    const uint8_t *addr = khash + 12;  /* 20-byte address */
+
+    if (bloom_bits) {
+        /* Bloom mode: only write addresses that pass the filter */
+        if (!bloom_test(addr, bloom_bits, bloom_m, bloom_k)) return;
+        int slot = atomicAdd(out_count, 1);
+        out_indices[slot] = idx_buf[tid];
+        memcpy(out_addrs + (int64_t)slot * 20, addr, 20);
+    } else {
+        /* No bloom: write all results at thread's own slot */
+        out_indices[tid] = idx_buf[tid];
+        memcpy(out_addrs + (int64_t)tid * 20, addr, 20);
+    }
 }
 
 /* ================================================================
- * Host function
+ * Host-side persistent state
+ * All buffers are allocated once and reused across calls.
+ * Not thread-safe; callers must serialise (GPU mode uses 1 goroutine).
+ * ================================================================ */
+
+/* Persistent intermediate buffers (kernel 1 → kernel 2) */
+static int16_t *g_d_wi          = NULL;
+static int64_t *g_d_valid_idx   = NULL;
+static int     *g_d_valid_count = NULL;
+/* Persistent output buffers (kernel 2 → host) */
+static uint8_t *g_d_addrs       = NULL;
+static int64_t *g_d_indices     = NULL;
+static int     *g_d_out_count   = NULL;  /* for bloom-filtered output count */
+static int64_t  g_buf_capacity  = 0;     /* capacity of the buffers above  */
+
+/* Persistent Bloom filter on GPU */
+static uint64_t *g_d_bloom  = NULL;
+static uint64_t  g_bloom_m  = 0;
+static uint32_t  g_bloom_k  = 0;
+
+/* Ensure persistent buffers are (re-)allocated for given capacity */
+static int ensure_buffers(int64_t capacity)
+{
+    if (capacity <= g_buf_capacity) return 0;
+    /* Free old buffers */
+    if (g_d_wi)          { cudaFree(g_d_wi);          g_d_wi          = NULL; }
+    if (g_d_valid_idx)   { cudaFree(g_d_valid_idx);   g_d_valid_idx   = NULL; }
+    if (g_d_valid_count) { cudaFree(g_d_valid_count); g_d_valid_count = NULL; }
+    if (g_d_addrs)       { cudaFree(g_d_addrs);       g_d_addrs       = NULL; }
+    if (g_d_indices)     { cudaFree(g_d_indices);     g_d_indices     = NULL; }
+    if (g_d_out_count)   { cudaFree(g_d_out_count);   g_d_out_count   = NULL; }
+    g_buf_capacity = 0;
+
+    if (cudaMalloc(&g_d_wi,          (size_t)capacity * 12 * sizeof(int16_t)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&g_d_valid_idx,   (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
+    if (cudaMalloc(&g_d_valid_count, sizeof(int))                             != cudaSuccess) goto fail;
+    if (cudaMalloc(&g_d_addrs,       (size_t)capacity * 20)                   != cudaSuccess) goto fail;
+    if (cudaMalloc(&g_d_indices,     (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
+    if (cudaMalloc(&g_d_out_count,   sizeof(int))                             != cudaSuccess) goto fail;
+    g_buf_capacity = capacity;
+    return 0;
+fail:
+    if (g_d_wi)          { cudaFree(g_d_wi);          g_d_wi          = NULL; }
+    if (g_d_valid_idx)   { cudaFree(g_d_valid_idx);   g_d_valid_idx   = NULL; }
+    if (g_d_valid_count) { cudaFree(g_d_valid_count); g_d_valid_count = NULL; }
+    if (g_d_addrs)       { cudaFree(g_d_addrs);       g_d_addrs       = NULL; }
+    if (g_d_indices)     { cudaFree(g_d_indices);     g_d_indices     = NULL; }
+    if (g_d_out_count)   { cudaFree(g_d_out_count);   g_d_out_count   = NULL; }
+    return -1;
+}
+
+/* ================================================================
+ * Host functions
  * ================================================================ */
 extern "C" {
 
@@ -609,71 +758,121 @@ int gpu_enumerate_compute(
     int64_t total = end_idx - start_idx;
     if (total <= 0) { *out_count = 0; return 0; }
 
-    int16_t *d_known       = NULL;
-    int8_t  *d_unk         = NULL;
-    int16_t *d_wi          = NULL;  /* kernel-1 output: word indices [capacity*12] */
-    int64_t *d_valid_idx   = NULL;  /* kernel-1 output: original indices [capacity] */
-    int     *d_valid_count = NULL;
-    uint8_t *d_addrs       = NULL;  /* kernel-2 output: addresses [capacity*20] */
-    int64_t *d_indices     = NULL;  /* kernel-2 output: indices   [capacity]    */
+    /* Ensure persistent buffers are large enough.
+     * Also set the device stack limit once here; both kernels share the same
+     * 65536-byte limit – Kernel 1 over-allocates (uses only ~400 bytes) but
+     * avoids the expensive per-call cudaDeviceSetLimit + implicit sync. */
+    if (ensure_buffers((int64_t)capacity) != 0) return -1;
+    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
 
-    if (cudaMalloc(&d_known,       12 * sizeof(int16_t))                     != cudaSuccess) goto err;
-    if (cudaMalloc(&d_unk,         (int)unknown_count * sizeof(int8_t))      != cudaSuccess) goto err;
-    if (cudaMalloc(&d_wi,          (size_t)capacity * 12 * sizeof(int16_t))  != cudaSuccess) goto err;
-    if (cudaMalloc(&d_valid_idx,   (size_t)capacity * sizeof(int64_t))       != cudaSuccess) goto err;
-    if (cudaMalloc(&d_valid_count, sizeof(int))                              != cudaSuccess) goto err;
-    if (cudaMalloc(&d_addrs,       (size_t)capacity * 20)                    != cudaSuccess) goto err;
-    if (cudaMalloc(&d_indices,     (size_t)capacity * sizeof(int64_t))       != cudaSuccess) goto err;
+    /* Per-call small allocations: template only (12*2 + unk*1 bytes, tiny) */
+    int16_t *d_known = NULL;
+    int8_t  *d_unk   = NULL;
+    if (cudaMalloc(&d_known, 12 * sizeof(int16_t))               != cudaSuccess) goto err;
+    if (cudaMalloc(&d_unk,   (int)unknown_count * sizeof(int8_t)) != cudaSuccess) goto err;
 
     cudaMemcpy(d_known, known_words, 12 * sizeof(int16_t),                cudaMemcpyHostToDevice);
     cudaMemcpy(d_unk,   unknown_pos, (int)unknown_count * sizeof(int8_t), cudaMemcpyHostToDevice);
-    cudaMemset(d_valid_count, 0, sizeof(int));
+    cudaMemset(g_d_valid_count, 0, sizeof(int));
 
-    /* --- Kernel 1: BIP39 filter (small stack, 256 threads/block) --- */
-    cudaDeviceSetLimit(cudaLimitStackSize, 1024);
+    /* --- Kernel 1: BIP39 filter (256 threads/block) --- */
     {
         int bs = 256, nb = (int)((total + bs - 1) / bs);
         bip39_filter_kernel<<<nb, bs>>>(
             start_idx, total,
             d_known, d_unk, unknown_count,
-            d_wi, d_valid_idx, capacity, d_valid_count);
+            g_d_wi, g_d_valid_idx, capacity, g_d_valid_count);
         if (cudaDeviceSynchronize() != cudaSuccess) goto err;
     }
 
-    /* Retrieve valid count; then launch Kernel 2 only if there is work */
+    cudaFree(d_known); d_known = NULL;
+    cudaFree(d_unk);   d_unk   = NULL;
+
+    /* Retrieve valid count */
     {
         int cnt = 0;
-        cudaMemcpy(&cnt, d_valid_count, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&cnt, g_d_valid_count, sizeof(int), cudaMemcpyDeviceToHost);
         if (cnt > capacity) cnt = capacity;
-        *out_count = cnt;
 
         if (cnt > 0) {
-            /* --- Kernel 2: TRON derivation (large stack, 32 threads/block) --- */
-            cudaDeviceSetLimit(cudaLimitStackSize, 65536);
-            int bs = 32, nb = (cnt + bs - 1) / bs;
-            tron_derive_kernel<<<nb, bs>>>(
-                d_wi, d_valid_idx, cnt,
-                d_addrs, d_indices);
-            if (cudaDeviceSynchronize() != cudaSuccess) goto err;
+            /* --- Kernel 2: TRON derivation (32 threads/block) --- */
+            int out_cnt;
+            if (g_d_bloom) {
+                /* Bloom mode: output only matching addresses */
+                cudaMemset(g_d_out_count, 0, sizeof(int));
+                int bs = 32, nb = (cnt + bs - 1) / bs;
+                tron_derive_kernel<<<nb, bs>>>(
+                    g_d_wi, g_d_valid_idx, cnt,
+                    g_d_addrs, g_d_indices, g_d_out_count,
+                    g_d_bloom, g_bloom_m, g_bloom_k);
+                if (cudaDeviceSynchronize() != cudaSuccess) return -1;
+                cudaMemcpy(&out_cnt, g_d_out_count, sizeof(int), cudaMemcpyDeviceToHost);
+                if (out_cnt > capacity) out_cnt = capacity;
+            } else {
+                /* No bloom: write all cnt results */
+                int bs = 32, nb = (cnt + bs - 1) / bs;
+                tron_derive_kernel<<<nb, bs>>>(
+                    g_d_wi, g_d_valid_idx, cnt,
+                    g_d_addrs, g_d_indices, NULL,
+                    NULL, 0, 0);
+                if (cudaDeviceSynchronize() != cudaSuccess) return -1;
+                out_cnt = cnt;
+            }
 
-            cudaMemcpy(out_addrs,   d_addrs,   (size_t)cnt * 20,              cudaMemcpyDeviceToHost);
-            cudaMemcpy(out_indices, d_indices, (size_t)cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+            *out_count = out_cnt;
+            if (out_cnt > 0) {
+                cudaMemcpy(out_addrs,   g_d_addrs,   (size_t)out_cnt * 20,              cudaMemcpyDeviceToHost);
+                cudaMemcpy(out_indices, g_d_indices, (size_t)out_cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+            }
+        } else {
+            *out_count = 0;
         }
     }
 
-    cudaFree(d_known);  cudaFree(d_unk);
-    cudaFree(d_wi);     cudaFree(d_valid_idx); cudaFree(d_valid_count);
-    cudaFree(d_addrs);  cudaFree(d_indices);
     return 0;
 err:
-    if (d_known)       cudaFree(d_known);
-    if (d_unk)         cudaFree(d_unk);
-    if (d_wi)          cudaFree(d_wi);
-    if (d_valid_idx)   cudaFree(d_valid_idx);
-    if (d_valid_count) cudaFree(d_valid_count);
-    if (d_addrs)       cudaFree(d_addrs);
-    if (d_indices)     cudaFree(d_indices);
+    if (d_known) cudaFree(d_known);
+    if (d_unk)   cudaFree(d_unk);
     return -1;
 }
+
+/* Upload bloom filter to GPU persistent memory.
+ * words: raw uint64 bitset from BloomFilter.BitSet().Bytes()
+ * word_count: len(words)
+ * m: total bits (BloomFilter.Cap())
+ * k: hash functions (BloomFilter.K()) */
+int gpu_bloom_upload(const uint64_t *words, uint64_t word_count, uint64_t m, uint32_t k)
+{
+    if (g_d_bloom) { cudaFree(g_d_bloom); g_d_bloom = NULL; }
+    if (cudaMalloc(&g_d_bloom, word_count * sizeof(uint64_t)) != cudaSuccess) return -1;
+    if (cudaMemcpy(g_d_bloom, words, word_count * sizeof(uint64_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(g_d_bloom); g_d_bloom = NULL; return -1;
+    }
+    g_bloom_m = m;
+    g_bloom_k = k;
+    return 0;
+}
+
+/* Release GPU bloom filter memory */
+void gpu_bloom_free(void)
+{
+    if (g_d_bloom) { cudaFree(g_d_bloom); g_d_bloom = NULL; }
+    g_bloom_m = 0; g_bloom_k = 0;
+}
+
+/* Release all persistent GPU buffers (call on shutdown) */
+void gpu_enumerate_cleanup(void)
+{
+    gpu_bloom_free();
+    if (g_d_wi)          { cudaFree(g_d_wi);          g_d_wi          = NULL; }
+    if (g_d_valid_idx)   { cudaFree(g_d_valid_idx);   g_d_valid_idx   = NULL; }
+    if (g_d_valid_count) { cudaFree(g_d_valid_count); g_d_valid_count = NULL; }
+    if (g_d_addrs)       { cudaFree(g_d_addrs);       g_d_addrs       = NULL; }
+    if (g_d_indices)     { cudaFree(g_d_indices);     g_d_indices     = NULL; }
+    if (g_d_out_count)   { cudaFree(g_d_out_count);   g_d_out_count   = NULL; }
+    g_buf_capacity = 0;
+}
+
 
 } /* extern "C" */
