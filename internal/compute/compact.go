@@ -65,14 +65,16 @@ func (c *CompactComputer) ComputeRange(
 	task *protocol.CompactTask,
 	bloomFilter func([]byte) bool,
 ) *protocol.CompactResult {
-	// 优先使用 GPU 原生路径：枚举+校验+计算全部在 GPU 完成
+	// 流水线模式优先（多CPU枚举→GPU计算）：SIMT分歧问题导致GPU原生枚举效率极低
+	// （仅6.2%的线程通过BIP39校验，其余93.8%闲置等待warp完成），流水线模式避开此问题
+	if c.enumWorkers > 1 {
+		return c.computeRangePipelined(enum, task, bloomFilter)
+	}
+	// GPU原生路径：仅在无流水线时使用
 	if re, ok := c.computer.(rangeEnumerator); ok {
 		if ie, ok := enum.(IndexedEnumerator); ok {
 			return c.computeRangeGPUNative(re, enum, ie, task, bloomFilter)
 		}
-	}
-	if c.enumWorkers > 1 {
-		return c.computeRangePipelined(enum, task, bloomFilter)
 	}
 	return c.computeRangeParallel(enum, task, bloomFilter)
 }
