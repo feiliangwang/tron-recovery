@@ -48,19 +48,26 @@ bloomtool:
 	@mkdir -p $(BUILD_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/bloomtool ./cmd/bloomtool
 
-# 编译CUDA静态库
-internal/compute/libgpu_cuda.a: internal/compute/gpu.cu internal/compute/gpu_bridge.h
+# 编译CUDA静态库（独立编译：每个 .cu 自包含，避免 ptxas 跨 kernel 干扰）
+internal/compute/libgpu_cuda.a: internal/compute/gpu.cu internal/compute/gpu_enumerate.cu internal/compute/gpu_bridge.h
 	$(NVCC) -O2 -arch=$(CUDA_ARCH) --compiler-options -fPIC \
 		-I$(CUDA_INCLUDE) \
 		-c internal/compute/gpu.cu \
 		-o internal/compute/gpu.o
-	ar rcs internal/compute/libgpu_cuda.a internal/compute/gpu.o
-	rm -f internal/compute/gpu.o
+	$(NVCC) -O2 -arch=$(CUDA_ARCH) --compiler-options -fPIC \
+		-I$(CUDA_INCLUDE) \
+		-c internal/compute/gpu_enumerate.cu \
+		-o internal/compute/gpu_enumerate.o
+	ar rcs internal/compute/libgpu_cuda.a \
+		internal/compute/gpu.o \
+		internal/compute/gpu_enumerate.o
+	rm -f internal/compute/gpu.o internal/compute/gpu_enumerate.o
 
 # GPU版本Worker
 worker-gpu: internal/compute/libgpu_cuda.a
 	@echo "构建GPU版本Worker..."
 	@mkdir -p $(BUILD_DIR)
+	$(GOCMD) clean -cache
 	CGO_LDFLAGS="-L$(CURDIR)/internal/compute -lgpu_cuda -L$(CUDA_LIB) -lcudart" \
 	$(GOBUILD) $(LDFLAGS) -tags cuda -o $(BUILD_DIR)/worker-gpu ./cmd/worker
 

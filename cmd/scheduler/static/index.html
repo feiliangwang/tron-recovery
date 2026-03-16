@@ -44,9 +44,19 @@
         .create-form {
             background: #1e293b;
             border-radius: 12px;
-            padding: 20px;
+            padding: 0;
             margin-bottom: 24px;
+            overflow: hidden;
         }
+        .create-form-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 14px 20px; cursor: pointer; user-select: none;
+        }
+        .create-form-header:hover { background: #243147; }
+        .create-form-header h3 { font-size: 14px; color: #94a3b8; font-weight: 500; }
+        .create-form-toggle { color: #64748b; font-size: 12px; }
+        .create-form-body { padding: 0 20px 20px; }
+        .create-form-body.collapsed { display: none; }
         .form-row {
             display: grid;
             grid-template-columns: 1fr 200px;
@@ -80,6 +90,15 @@
             grid-template-columns: 1fr 420px;
             gap: 24px;
         }
+
+        /* 折叠的job-card */
+        .job-card-body.collapsed { display: none; }
+        .job-card-header-row {
+            display: flex; justify-content: space-between; align-items: center;
+            cursor: pointer; user-select: none;
+        }
+        .job-card-header-row:hover .job-name { color: #22d3ee; }
+        .job-expand-icon { color: #64748b; font-size: 11px; margin-left: 8px; }
 
         /* 任务列表 */
         .section-title {
@@ -244,22 +263,28 @@
             </div>
         </div>
 
-        <!-- 创建任务 -->
+        <!-- 创建任务（默认折叠） -->
         <div class="create-form">
-            <div class="form-row">
-                <div>
-                    <label>任务名称</label>
-                    <input type="text" id="job-name" placeholder="例如: 钱包A恢复">
-                </div>
-                <div style="display: flex; align-items: flex-end;">
-                    <button class="btn btn-primary" style="width:100%" onclick="createJob()">创建任务</button>
-                </div>
+            <div class="create-form-header" onclick="toggleCreateForm()">
+                <h3>+ 创建任务</h3>
+                <span class="create-form-toggle" id="create-form-toggle">▶ 展开</span>
             </div>
-            <div class="form-row full">
-                <label>助记词模板（未知词用 ? 代替）</label>
-                <input type="text" id="mnemonic" placeholder="例如: word1 ? ? word4 word5 word6 word7 word8 word9 word10 word11 word12">
+            <div class="create-form-body collapsed" id="create-form-body">
+                <div class="form-row">
+                    <div>
+                        <label>任务名称</label>
+                        <input type="text" id="job-name" placeholder="例如: 钱包A恢复">
+                    </div>
+                    <div style="display: flex; align-items: flex-end;">
+                        <button class="btn btn-primary" style="width:100%" onclick="createJob()">创建任务</button>
+                    </div>
+                </div>
+                <div class="form-row full">
+                    <label>助记词模板（未知词用 ? 代替）</label>
+                    <input type="text" id="mnemonic" placeholder="例如: word1 ? ? word4 word5 word6 word7 word8 word9 word10 word11 word12">
+                </div>
+                <div class="batch-hint">💡 批次大小由调度器根据各 Worker 实时枚举速度自动分配，目标每批约 30 秒工作量</div>
             </div>
-            <div class="batch-hint">💡 批次大小由调度器根据各 Worker 实时枚举速度自动分配，目标每批约 30 秒工作量</div>
         </div>
 
         <!-- 主内容 -->
@@ -306,6 +331,26 @@
     <script>
         // 记录各 Worker 历史最高速度，用于绘制相对进度条
         const peakSpeeds = {};
+
+        // 任务/匹配列表稳定排序：记录首次出现顺序
+        const jobOrder = [];
+        const matchOrder = [];
+
+        // 折叠状态：job-id → true/false（true=展开）
+        const jobExpanded = {};
+
+        function toggleCreateForm() {
+            const body = document.getElementById('create-form-body');
+            const toggle = document.getElementById('create-form-toggle');
+            const collapsed = body.classList.toggle('collapsed');
+            toggle.textContent = collapsed ? '▶ 展开' : '▼ 收起';
+        }
+
+        function toggleJob(id) {
+            jobExpanded[id] = !jobExpanded[id];
+            document.getElementById('job-body-' + id).classList.toggle('collapsed', !jobExpanded[id]);
+            document.getElementById('job-icon-' + id).textContent = jobExpanded[id] ? '▼' : '▶';
+        }
 
         async function fetchAPI(path) {
             const res = await fetch('/api' + path);
@@ -364,9 +409,23 @@
                 return;
             }
 
-            grid.innerHTML = jobs.map(job => {
+            // 稳定排序：按首次出现顺序排列，新任务追加到末尾
+            const jobMap = {};
+            jobs.forEach(j => jobMap[j.id] = j);
+            jobs.forEach(j => { if (!jobOrder.includes(j.id)) jobOrder.push(j.id); });
+            const sorted = jobOrder.filter(id => jobMap[id]).map(id => jobMap[id]);
+
+            // 新任务（running）默认展开；其他状态默认折叠
+            sorted.forEach(job => {
+                if (!(job.id in jobExpanded)) {
+                    jobExpanded[job.id] = (job.status === 'running');
+                }
+            });
+
+            grid.innerHTML = sorted.map(job => {
                 const progress = job.total > 0 ? (job.completed / job.total * 100).toFixed(2) : 0;
                 const statusClass = 'status-' + job.status;
+                const expanded = jobExpanded[job.id];
 
                 // 运行时长
                 const elapsed = job.elapsed_seconds > 0 ? formatDuration(job.elapsed_seconds) : '-';
@@ -398,24 +457,29 @@
 
                 return `
                     <div class="job-card">
-                        <div class="job-header">
-                            <div class="job-name">${job.name || job.id}</div>
+                        <div class="job-card-header-row" onclick="toggleJob('${job.id}')">
+                            <div style="display:flex;align-items:center;gap:8px">
+                                <div class="job-name">${job.name || job.id}</div>
+                                <span class="job-expand-icon" id="job-icon-${job.id}">${expanded ? '▼' : '▶'}</span>
+                            </div>
                             <span class="job-status ${statusClass}">${job.status}</span>
                         </div>
-                        <div class="job-mnemonic">${job.mnemonic}</div>
-                        <div class="progress-bar">
-                            <div class="progress-fill" style="width: ${progress}%"></div>
+                        <div class="job-card-body${expanded ? '' : ' collapsed'}" id="job-body-${job.id}">
+                            <div class="job-mnemonic" style="margin-top:8px">${job.mnemonic}</div>
+                            <div class="progress-bar">
+                                <div class="progress-fill" style="width: ${progress}%"></div>
+                            </div>
+                            <div class="progress-stats">
+                                <span>进度: <span class="stat-value">${progress}%</span></span>
+                                <span>已完成: <span class="stat-value">${formatNum(job.completed)}</span></span>
+                                <span>总计: <span class="stat-value">${formatNum(job.total)}</span></span>
+                                <span>速度: <span class="stat-value">${speed}</span></span>
+                                <span>运行时长: <span class="stat-value">${elapsed}</span></span>
+                                <span>预计完成: <span class="stat-value">${eta}</span></span>
+                                <span>匹配: <span class="stat-value">${job.matches || 0}</span></span>
+                            </div>
+                            <div class="job-actions">${actions}</div>
                         </div>
-                        <div class="progress-stats">
-                            <span>进度: <span class="stat-value">${progress}%</span></span>
-                            <span>已完成: <span class="stat-value">${formatNum(job.completed)}</span></span>
-                            <span>总计: <span class="stat-value">${formatNum(job.total)}</span></span>
-                            <span>速度: <span class="stat-value">${speed}</span></span>
-                            <span>运行时长: <span class="stat-value">${elapsed}</span></span>
-                            <span>预计完成: <span class="stat-value">${eta}</span></span>
-                            <span>匹配: <span class="stat-value">${job.matches || 0}</span></span>
-                        </div>
-                        <div class="job-actions">${actions}</div>
                     </div>
                 `;
             }).join('');
@@ -473,9 +537,15 @@
             const data = await fetchAPI('/matches');
             const matches = data.matches || [];
 
-            // 分类：已激活 / 全部
-            const confirmed = matches.filter(m => m.confirmed === true);
-            const allRecent = matches.slice(-20).reverse();
+            // 稳定排序：按首次出现顺序，新匹配追加
+            const matchMap = {};
+            matches.forEach(m => matchMap[m.address] = m);
+            matches.forEach(m => { if (!matchOrder.includes(m.address)) matchOrder.push(m.address); });
+            const stableMatches = matchOrder.filter(a => matchMap[a]).map(a => matchMap[a]);
+
+            // 分类：已激活 / 全部（取最新20条，但顺序固定）
+            const confirmed = stableMatches.filter(m => m.confirmed === true);
+            const allRecent = stableMatches.slice(-20).reverse();
 
             // 统计
             document.getElementById('match-count').textContent = `${matches.length} 个`;

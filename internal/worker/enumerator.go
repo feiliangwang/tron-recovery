@@ -69,3 +69,30 @@ func (e *LocalEnumerator) GetMnemonic(words []string) string {
 func (e *LocalEnumerator) GetWordCount() int64 {
 	return e.wordCount
 }
+
+// TemplateIndices 返回模板的词索引表示，供 GPU 原生枚举使用。
+// 实现 compute.IndexedEnumerator 接口。
+// knownWordIndices[i] = -1 表示该位置未知，否则为 BIP39 词表索引（0-2047）。
+// unknownPositions 按枚举分解顺序排列（与 EnumerateAt 中的 UnknownPos 一致）。
+func (e *LocalEnumerator) TemplateIndices() (knownWordIndices []int16, unknownPositions []int8) {
+	// 构建词 → 索引的反查表
+	wordToIdx := make(map[string]int16, len(e.wordList))
+	for i, w := range e.wordList {
+		wordToIdx[w] = int16(i)
+	}
+
+	knownWordIndices = make([]int16, len(e.template.Words))
+	for i, w := range e.template.Words {
+		if w == "" {
+			knownWordIndices[i] = -1
+		} else {
+			knownWordIndices[i] = wordToIdx[w]
+		}
+	}
+
+	unknownPositions = make([]int8, len(e.template.UnknownPos))
+	for i, pos := range e.template.UnknownPos {
+		unknownPositions[i] = int8(pos)
+	}
+	return
+}

@@ -13,10 +13,22 @@ type Enumerator interface {
 	EnumerateAt(idx int64, validator *mnemonic.Validator) ([]string, bool)
 }
 
+// IndexedEnumerator 可将模板以词索引形式提供给 GPU 侧枚举（可选接口）
+type IndexedEnumerator interface {
+	TemplateIndices() (knownWordIndices []int16, unknownPositions []int8)
+}
+
+// rangeEnumerator 支持 GPU 原生枚举+计算（可选接口，由 GPUComputer 实现）
+type rangeEnumerator interface {
+	EnumerateCompute(startIdx, endIdx int64, knownWordIndices []int16, unknownPositions []int8) ([]int64, [][]byte, error)
+}
+
 // CompactComputer 紧凑计算器
 type CompactComputer struct {
-	workers  int
-	computer SeedComputer
+	workers     int
+	enumWorkers int // 枚举并发数（>1 时启用流水线模式）
+	batchSize   int64
+	computer    SeedComputer
 }
 
 // NewCompactComputer 创建紧凑计算器
@@ -24,11 +36,166 @@ func NewCompactComputer(workers int, computer SeedComputer) *CompactComputer {
 	if workers <= 0 {
 		workers = 4
 	}
-	return &CompactComputer{workers: workers, computer: computer}
+	return &CompactComputer{workers: workers, batchSize: 500, computer: computer}
+}
+
+// SetBatchSize 设置每次 Compute 调用的批次大小
+func (c *CompactComputer) SetBatchSize(n int64) {
+	if n > 0 {
+		c.batchSize = n
+	}
+}
+
+// SetEnumWorkers 设置枚举并发数（>1 时启用流水线：多CPU枚举→单GPU计算）
+func (c *CompactComputer) SetEnumWorkers(n int) {
+	if n > 0 {
+		c.enumWorkers = n
+	}
+}
+
+// GetSeedComputer 返回底层 SeedComputer（供外层检查是否支持 GPU bloom 上传等接口）
+func (c *CompactComputer) GetSeedComputer() SeedComputer {
+	return c.computer
+}
+
+// enumBatch 枚举结果批次
+type enumBatch struct {
+	mnemonics []string
+	idxMap    map[string]int64
 }
 
 // ComputeRange 计算位置范围内的匹配
 func (c *CompactComputer) ComputeRange(
+	enum Enumerator,
+	task *protocol.CompactTask,
+	bloomFilter func([]byte) bool,
+) *protocol.CompactResult {
+	// GPU原生路径优先：两阶段kernel（bip39_filter_kernel + tron_derive_kernel）
+	// 消除了SIMT warp分歧，100%线程利用率，CPU→GPU传输仅56字节/任务
+	if re, ok := c.computer.(rangeEnumerator); ok {
+		if ie, ok := enum.(IndexedEnumerator); ok {
+			return c.computeRangeGPUNative(re, enum, ie, task, bloomFilter)
+		}
+	}
+	// 流水线模式：多CPU并行枚举 → GPU批量计算（无GPU原生支持时的后备）
+	if c.enumWorkers > 1 {
+		return c.computeRangePipelined(enum, task, bloomFilter)
+	}
+	return c.computeRangeParallel(enum, task, bloomFilter)
+}
+
+// computeRangeGPUNative GPU 原生枚举路径：索引范围直接送入 GPU，完全跳过 CPU 枚举
+func (c *CompactComputer) computeRangeGPUNative(
+	re rangeEnumerator,
+	enum Enumerator,
+	ie IndexedEnumerator,
+	task *protocol.CompactTask,
+	bloomFilter func([]byte) bool,
+) *protocol.CompactResult {
+	result := &protocol.CompactResult{
+		TaskID:  task.TaskID,
+		Matches: make([]protocol.MatchData, 0),
+	}
+
+	known, unkPos := ie.TemplateIndices()
+	batchSize := c.batchSize
+
+	for start := task.StartIdx; start < task.EndIdx; start += batchSize {
+		end := start + batchSize
+		if end > task.EndIdx {
+			end = task.EndIdx
+		}
+
+		idxs, addrs, err := re.EnumerateCompute(start, end, known, unkPos)
+		if err != nil {
+			// GPU 失败时回退到 CPU 流水线处理本批
+			eb := c.enumerateBatch(enum, start, end)
+			cpuAddrs := c.computer.Compute(eb.mnemonics)
+			for i, addr := range cpuAddrs {
+				if bloomFilter != nil && !bloomFilter(addr) {
+					continue
+				}
+				result.Matches = append(result.Matches, protocol.MatchData{
+					Index:   eb.idxMap[eb.mnemonics[i]],
+					Address: addr,
+				})
+			}
+			continue
+		}
+
+		for i, addr := range addrs {
+			if bloomFilter != nil && !bloomFilter(addr) {
+				continue
+			}
+			result.Matches = append(result.Matches, protocol.MatchData{
+				Index:   idxs[i],
+				Address: addr,
+			})
+		}
+	}
+
+	return result
+}
+
+// computeRangePipelined 流水线模式：多CPU并行枚举 → 单线程计算（适合GPU）
+// 枚举和计算重叠执行，消除CPU等GPU / GPU等CPU的空闲时间
+func (c *CompactComputer) computeRangePipelined(
+	enum Enumerator,
+	task *protocol.CompactTask,
+	bloomFilter func([]byte) bool,
+) *protocol.CompactResult {
+	result := &protocol.CompactResult{
+		TaskID:  task.TaskID,
+		Matches: make([]protocol.MatchData, 0),
+	}
+
+	batchSize := c.batchSize
+	// channel buffer = enumWorkers*2，让枚举提前预备，避免 GPU 空等
+	batchCh := make(chan *enumBatch, c.enumWorkers*2)
+
+	// 枚举生产者：enumWorkers 个并行 goroutine
+	go func() {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, c.enumWorkers)
+		for start := task.StartIdx; start < task.EndIdx; start += batchSize {
+			end := start + batchSize
+			if end > task.EndIdx {
+				end = task.EndIdx
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(s, e int64) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				batchCh <- c.enumerateBatch(enum, s, e)
+			}(start, end)
+		}
+		wg.Wait()
+		close(batchCh)
+	}()
+
+	// 计算消费者：单线程顺序消费（GPU 不支持并发调用）
+	for eb := range batchCh {
+		if len(eb.mnemonics) == 0 {
+			continue
+		}
+		addrs := c.computer.Compute(eb.mnemonics)
+		for i, addr := range addrs {
+			if bloomFilter != nil && !bloomFilter(addr) {
+				continue
+			}
+			result.Matches = append(result.Matches, protocol.MatchData{
+				Index:   eb.idxMap[eb.mnemonics[i]],
+				Address: addr,
+			})
+		}
+	}
+
+	return result
+}
+
+// computeRangeParallel 原始并行模式：每个 goroutine 独立枚举+计算（适合多核CPU）
+func (c *CompactComputer) computeRangeParallel(
 	enum Enumerator,
 	task *protocol.CompactTask,
 	bloomFilter func([]byte) bool,
@@ -42,8 +209,7 @@ func (c *CompactComputer) ComputeRange(
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, c.workers)
 
-	// 按批次并行处理
-	batchSize := int64(500)
+	batchSize := c.batchSize
 	for start := task.StartIdx; start < task.EndIdx; start += batchSize {
 		end := start + batchSize
 		if end > task.EndIdx {
@@ -56,7 +222,18 @@ func (c *CompactComputer) ComputeRange(
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			matches := c.processBatch(enum, s, e, bloomFilter)
+			eb := c.enumerateBatch(enum, s, e)
+			addrs := c.computer.Compute(eb.mnemonics)
+			matches := make([]protocol.MatchData, 0)
+			for i, addr := range addrs {
+				if bloomFilter != nil && !bloomFilter(addr) {
+					continue
+				}
+				matches = append(matches, protocol.MatchData{
+					Index:   eb.idxMap[eb.mnemonics[i]],
+					Address: addr,
+				})
+			}
 			if len(matches) > 0 {
 				mu.Lock()
 				result.Matches = append(result.Matches, matches...)
@@ -69,18 +246,12 @@ func (c *CompactComputer) ComputeRange(
 	return result
 }
 
-// processBatch 处理一个批次
-func (c *CompactComputer) processBatch(
-	enum Enumerator,
-	start, end int64,
-	bloomFilter func([]byte) bool,
-) []protocol.MatchData {
-	matches := make([]protocol.MatchData, 0)
+// enumerateBatch 枚举一个批次，返回有效助记词和索引映射
+func (c *CompactComputer) enumerateBatch(enum Enumerator, start, end int64) *enumBatch {
 	validator := mnemonic.NewValidator()
-	idxMap := make(map[string]int64)
-	mnemonics := make([]string, 0)
+	idxMap := make(map[string]int64, int(end-start)/16)
+	mnemonics := make([]string, 0, int(end-start)/16)
 	for idx := start; idx < end; idx++ {
-		// 枚举位置
 		words, valid := enum.EnumerateAt(idx, validator)
 		if !valid {
 			continue
@@ -89,18 +260,5 @@ func (c *CompactComputer) processBatch(
 		idxMap[join] = idx
 		mnemonics = append(mnemonics, join)
 	}
-	// 计算地址
-	for idx, address := range c.computer.Compute(mnemonics) {
-		// Bloom过滤（如果有）
-		if bloomFilter != nil && !bloomFilter(address) {
-			continue
-		}
-		// 匹配
-		matches = append(matches, protocol.MatchData{
-			Index:   idxMap[mnemonics[idx]],
-			Address: address,
-		})
-	}
-
-	return matches
+	return &enumBatch{mnemonics: mnemonics, idxMap: idxMap}
 }

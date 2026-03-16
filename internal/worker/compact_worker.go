@@ -12,6 +12,13 @@ import (
 	"boon/internal/protocol"
 )
 
+// speedEntry 速度滑动窗口条目
+type speedEntry struct {
+	t        time.Time     // 任务提交时间（用于窗口裁剪）
+	indices  int64
+	duration time.Duration // 实际计算耗时
+}
+
 // pendingTask 带模板的待处理任务（每次从服务器获取，不在本地存储）
 type pendingTask struct {
 	task     *protocol.CompactTask
@@ -40,8 +47,11 @@ type CompactWorker struct {
 		tasksComputed  int64
 		matchesFound   int64
 		indicesScanned int64
-		currentSpeed   int64 // 当前枚举速度（indices/s），上报给调度器用于动态分配
 	}
+
+	// 1分钟滑动窗口速度（按任务提交时间计算）
+	speedMu     sync.Mutex
+	speedWindow []speedEntry
 }
 
 // NewCompactWorker 创建紧凑Worker（使用CPU计算引擎）
@@ -62,9 +72,94 @@ func NewCompactWorkerWithComputer(id string, client *CompactClient, workers int,
 	}
 }
 
-// SetBloomFilter 设置Bloom过滤器
+// SetBloomFilter 设置Bloom过滤器；如果计算引擎支持 GPU 上传则同步上传到 GPU 显存
 func (w *CompactWorker) SetBloomFilter(filter *bloom.Filter) {
 	w.bloomFilter = filter
+	if filter == nil {
+		return
+	}
+	// If the underlying computer supports GPU bloom upload, do it now.
+	// This eliminates GPU→CPU address transfer for non-matching addresses.
+	type bloomUploader interface {
+		UploadBloomFilter(f *bloom.Filter) error
+	}
+	if up, ok := w.computer.GetSeedComputer().(bloomUploader); ok {
+		if err := up.UploadBloomFilter(filter); err != nil {
+			log.Printf("[Worker] GPU bloom upload failed (falling back to CPU filter): %v", err)
+		} else {
+			log.Printf("[Worker] Bloom filter uploaded to GPU (%d bits)", func() uint {
+				_, m, _ := filter.RawBits()
+				return m
+			}())
+		}
+	}
+}
+
+// SetBatchSize 设置 GPU/CPU 每次 Compute 调用的批次大小
+func (w *CompactWorker) SetBatchSize(n int64) {
+	w.computer.SetBatchSize(n)
+}
+
+// recordSpeed 记录一次任务提交，更新1分钟滑动窗口
+func (w *CompactWorker) recordSpeed(indices int64, elapsed time.Duration) {
+	now := time.Now()
+	cutoff := now.Add(-60 * time.Second)
+	w.speedMu.Lock()
+	defer w.speedMu.Unlock()
+	i := 0
+	for i < len(w.speedWindow) && w.speedWindow[i].t.Before(cutoff) {
+		i++
+	}
+	w.speedWindow = append(w.speedWindow[i:], speedEntry{t: now, indices: indices, duration: elapsed})
+}
+
+// getSpeed 返回滑动窗口内的平均速度（indices/s）= 总索引 / 总实际计算耗时
+func (w *CompactWorker) getSpeed() int64 {
+	now := time.Now()
+	cutoff := now.Add(-60 * time.Second)
+	w.speedMu.Lock()
+	defer w.speedMu.Unlock()
+	i := 0
+	for i < len(w.speedWindow) && w.speedWindow[i].t.Before(cutoff) {
+		i++
+	}
+	w.speedWindow = w.speedWindow[i:]
+	var totalIdx, totalDurNs int64
+	for _, e := range w.speedWindow {
+		totalIdx += e.indices
+		totalDurNs += int64(e.duration)
+	}
+	if totalDurNs <= 0 {
+		return 0
+	}
+	return int64(float64(totalIdx) / float64(totalDurNs) * 1e9)
+}
+
+// Warmup 启动前自测速：用固定模板跑一批，预填速度窗口，避免冷启动时分到过小的批次
+func (w *CompactWorker) Warmup() {
+	tmpl := &TaskTemplate{
+		JobID:      0,
+		Words:      []string{"abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "", "", "", ""},
+		UnknownPos: []int{8, 9, 10, 11},
+	}
+	benchSize := int64(65536)
+	task := &protocol.CompactTask{TaskID: 0, JobID: 0, StartIdx: 0, EndIdx: benchSize}
+	enum := NewLocalEnumerator(tmpl)
+
+	log.Printf("[Worker %s] 自测速中...", w.id)
+	start := time.Now()
+	w.computer.ComputeRange(enum, task, nil)
+	elapsed := time.Since(start)
+
+	if elapsed > 0 {
+		w.recordSpeed(benchSize, elapsed)
+		log.Printf("[Worker %s] 自测速: %d/s (%.2fs)", w.id, w.getSpeed(), elapsed.Seconds())
+	}
+}
+
+// SetEnumWorkers 设置枚举并发数（>1 时启用流水线：多CPU枚举→单GPU计算）
+func (w *CompactWorker) SetEnumWorkers(n int) {
+	w.computer.SetEnumWorkers(n)
 }
 
 // Start 启动Worker
@@ -128,7 +223,7 @@ func (w *CompactWorker) fetchTasks(ctx context.Context, count int) {
 		}
 
 		// 携带当前枚举速度，让调度器动态决定分配多大的枚举空间
-		speed := atomic.LoadInt64(&w.stats.currentSpeed)
+		speed := w.getSpeed()
 		task, err := w.client.FetchTask(w.id, speed)
 		if err != nil {
 			log.Printf("[Worker %s] 拉取任务失败: %v", w.id, err)
@@ -202,24 +297,13 @@ func (w *CompactWorker) processTask(ctx context.Context, pt *pendingTask) {
 	atomic.AddInt64(&w.stats.tasksComputed, 1)
 	atomic.AddInt64(&w.stats.indicesScanned, indices)
 
-	// 更新枚举速度（EWMA，平滑抖动），供下次握手上报给调度器
-	if elapsed > 0 {
-		newSpeed := int64(float64(indices) / elapsed.Seconds())
-		oldSpeed := atomic.LoadInt64(&w.stats.currentSpeed)
-		var smoothed int64
-		if oldSpeed == 0 {
-			smoothed = newSpeed
-		} else {
-			smoothed = int64(float64(oldSpeed)*0.8 + float64(newSpeed)*0.2)
-		}
-		atomic.StoreInt64(&w.stats.currentSpeed, smoothed)
-	}
-
 	// 提交结果
 	for retry := 0; retry < 3; retry++ {
 		err := w.client.SubmitResult(w.id, result)
 		if err == nil {
 			atomic.AddInt64(&w.stats.matchesFound, int64(len(result.Matches)))
+			// 提交成功后记录速度（按实际计算耗时，1分钟滑动窗口）
+			w.recordSpeed(indices, elapsed)
 			rate := float64(indices) / elapsed.Seconds()
 			if len(result.Matches) > 0 {
 				log.Printf("[Worker %s] 匹配! task=%d matches=%d 速率=%.0f/s",
@@ -249,7 +333,7 @@ func (w *CompactWorker) printStats(ctx context.Context) {
 			computed := atomic.LoadInt64(&w.stats.tasksComputed)
 			scanned := atomic.LoadInt64(&w.stats.indicesScanned)
 			matches := atomic.LoadInt64(&w.stats.matchesFound)
-			speed := atomic.LoadInt64(&w.stats.currentSpeed)
+			speed := w.getSpeed()
 			queue := len(w.taskQueue)
 
 			log.Printf("[Worker %s] 任务=%d 扫描=%d 匹配=%d 速度=%d/s 队列=%d",
