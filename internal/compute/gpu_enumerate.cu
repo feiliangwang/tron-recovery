@@ -75,13 +75,17 @@ __constant__ uint64_t EN_SHA512_K[80] = {
 typedef struct { uint64_t h[8]; uint8_t buf[128]; uint64_t total; uint32_t blen; } en_sha512_ctx;
 
 __device__ __noinline__ void en_sha512_compress(uint64_t h[8], const uint8_t blk[128]) {
-    uint64_t W[80];
-    for (int i=0;i<16;i++) W[i]=ec_load_be64(blk+i*8);
-    for (int i=16;i<80;i++) W[i]=EN_G1(W[i-2])+W[i-7]+EN_G0(W[i-15])+W[i-16];
+    /* W[16] circular buffer: 128 B stack vs 640 B with W[80].
+     * i>=16: W[i&15] is overwritten in-place (was W[i-16]), result is W[i]. */
+    uint64_t W[16];
+    for (int i = 0; i < 16; i++) W[i] = ec_load_be64(blk + i * 8);
     uint64_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
-    for (int i=0;i<80;i++){
-        uint64_t t1=hh+EN_S1(e)+EN_CH(e,f,g)+EN_SHA512_K[i]+W[i];
-        uint64_t t2=EN_S0(a)+EN_MAJ(a,b,c);
+    #pragma unroll 8
+    for (int i = 0; i < 80; i++) {
+        if (i >= 16)
+            W[i&15] = EN_G1(W[(i-2)&15]) + W[(i-7)&15] + EN_G0(W[(i-15)&15]) + W[i&15];
+        uint64_t t1 = hh + EN_S1(e) + EN_CH(e,f,g) + EN_SHA512_K[i] + W[i&15];
+        uint64_t t2 = EN_S0(a) + EN_MAJ(a,b,c);
         hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
     }
     h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
@@ -133,15 +137,37 @@ __device__ __noinline__ void en_hmac_sha512(
 __device__ __noinline__ void en_pbkdf2_hmac_sha512(
         const uint8_t *pw, uint32_t pwlen, uint8_t dk[64])
 {
-    uint8_t sb[12] = {'m','n','e','m','o','n','i','c',0,0,0,1};
-    uint8_t U[64], T[64];
-    en_hmac_sha512(pw,pwlen,sb,12,U);
-    memcpy(T,U,64);
-    for(int i=1;i<2048;i++){
-        en_hmac_sha512(pw,pwlen,U,64,U);
-        for(int j=0;j<64;j++) T[j]^=U[j];
+    /* Precompute ipad/opad states: 2 compressions total (once per mnemonic).
+     * Each PBKDF2 iteration then clones these states and pays only 2
+     * compressions (inner + outer), cutting 8192 → 4098 total. */
+    uint8_t k[128]; memset(k, 0, 128);
+    if (pwlen > 128) {
+        en_sha512_ctx t; en_sha512_init(&t);
+        en_sha512_update(&t, pw, pwlen); en_sha512_final(&t, k);
+    } else {
+        memcpy(k, pw, pwlen);
     }
-    memcpy(dk,T,64);
+    uint8_t ipad[128], opad[128];
+    for (int i = 0; i < 128; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+
+    en_sha512_ctx ipad_ctx, opad_ctx;
+    en_sha512_init(&ipad_ctx); en_sha512_update(&ipad_ctx, ipad, 128);
+    en_sha512_init(&opad_ctx); en_sha512_update(&opad_ctx, opad, 128);
+
+    /* First HMAC: msg = "mnemonic\0\0\0\1" (12 bytes) */
+    uint8_t sb[12] = {'m','n','e','m','o','n','i','c',0,0,0,1};
+    uint8_t U[64], T[64], inner[64];
+    { en_sha512_ctx t = ipad_ctx; en_sha512_update(&t, sb,    12); en_sha512_final(&t, inner); }
+    { en_sha512_ctx t = opad_ctx; en_sha512_update(&t, inner, 64); en_sha512_final(&t, U); }
+    memcpy(T, U, 64);
+
+    /* Remaining 2047 iterations: clone precomputed states, 2 compressions each */
+    for (int i = 1; i < 2048; i++) {
+        { en_sha512_ctx t = ipad_ctx; en_sha512_update(&t, U,     64); en_sha512_final(&t, inner); }
+        { en_sha512_ctx t = opad_ctx; en_sha512_update(&t, inner, 64); en_sha512_final(&t, U); }
+        for (int j = 0; j < 64; j++) T[j] ^= U[j];
+    }
+    memcpy(dk, T, 64);
 }
 
 /* ================================================================
@@ -320,14 +346,27 @@ __device__ __noinline__ void en_jp_madd(en_jpoint *r, const en_jpoint *p, const 
 }
 
 __device__ __noinline__ void en_ec_mul_G(en_jpoint *r, const en_u256 *k){
-    en_u256 Gx, Gy;
-    en_u256_from_be(&Gx, EN_GT[0].x);  /* EN_GT[0] = 1G = G */
-    en_u256_from_be(&Gy, EN_GT[0].y);
-    memset(r, 0, sizeof(*r));   /* infinity: Z=0 */
-    for(int bit = 255; bit >= 0; bit--){
-        en_jp_double(r, r);
-        if((k->d[bit>>5] >> (bit&31)) & 1)
-            en_jp_madd(r, r, &Gx, &Gy);
+    /* 4-bit fixed window using EN_GT[0..14] (1G..15G in constant memory).
+     * 256-bit scalar → 64 nibbles (MSB first).
+     * Doublings: 63*4 = 252 (vs 256).  Max madd: 64 (vs ~128). */
+    memset(r, 0, sizeof(*r));  /* infinity: Z=0 */
+    for (int i = 63; i >= 0; i--) {
+        /* 4 doublings before each nibble (skip the very first to avoid
+         * doubling an infinity point unnecessarily). */
+        if (i < 63) {
+            en_jp_double(r, r); en_jp_double(r, r);
+            en_jp_double(r, r); en_jp_double(r, r);
+        }
+        /* Extract 4-bit nibble at bit position [4i .. 4i+3].
+         * i*4 is always a multiple of 4, so the nibble never crosses a
+         * word boundary (bi ∈ {0,4,8,12,16,20,24,28}). */
+        int shift = i * 4;
+        uint32_t w = (k->d[shift >> 5] >> (shift & 31)) & 0xF;
+        if (w == 0) continue;
+        en_u256 gx, gy;
+        en_u256_from_be(&gx, EN_GT[w - 1].x);
+        en_u256_from_be(&gy, EN_GT[w - 1].y);
+        en_jp_madd(r, r, &gx, &gy);
     }
 }
 
