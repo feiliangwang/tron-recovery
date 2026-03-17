@@ -7,7 +7,10 @@
  */
 
 #define GPU_ENUMERATE_SHARED_ONLY
+#undef __device__
+#define __device__ static __attribute__((device))
 #include "gpu_enumerate.cu"
+#undef __device__
 
 /* ================================================================
  * Kernel: one thread per mnemonic
@@ -38,6 +41,74 @@ __global__ void tron_batch_kernel(
 }
 
 /* ================================================================
+ * Host-side persistent state – one slot per GPU device.
+ * Reuses batch buffers across Compute() calls to avoid repeated
+ * cudaMalloc/cudaFree overhead on the hot path.
+ * ================================================================ */
+#define MAX_DEVICES 8
+
+typedef struct {
+    uint8_t *d_data;
+    int     *d_off;
+    int     *d_len;
+    uint8_t *d_out;
+    int      data_capacity;
+    int      count_capacity;
+    int      stack_limit_set;
+} BatchState;
+
+static BatchState g_batch[MAX_DEVICES];
+
+static void free_count_buffers(BatchState *bs)
+{
+    if (bs->d_off) { cudaFree(bs->d_off); bs->d_off = NULL; }
+    if (bs->d_len) { cudaFree(bs->d_len); bs->d_len = NULL; }
+    if (bs->d_out) { cudaFree(bs->d_out); bs->d_out = NULL; }
+    bs->count_capacity = 0;
+}
+
+static int ensure_batch_buffers(int device_id, int data_bytes, int count)
+{
+    BatchState *bs = &g_batch[device_id];
+
+    if (data_bytes > bs->data_capacity) {
+        if (bs->d_data) { cudaFree(bs->d_data); bs->d_data = NULL; }
+        bs->data_capacity = 0;
+        if (cudaMalloc(&bs->d_data, (size_t)data_bytes) != cudaSuccess) return -1;
+        bs->data_capacity = data_bytes;
+    }
+
+    if (count > bs->count_capacity) {
+        free_count_buffers(bs);
+        if (cudaMalloc(&bs->d_off, (size_t)count * sizeof(int)) != cudaSuccess) goto fail;
+        if (cudaMalloc(&bs->d_len, (size_t)count * sizeof(int)) != cudaSuccess) goto fail;
+        if (cudaMalloc(&bs->d_out, (size_t)count * 20)          != cudaSuccess) goto fail;
+        bs->count_capacity = count;
+    }
+
+    if (!bs->stack_limit_set) {
+        if (cudaDeviceSetLimit(cudaLimitStackSize, 65536) != cudaSuccess) return -1;
+        bs->stack_limit_set = 1;
+    }
+    return 0;
+
+fail:
+    free_count_buffers(bs);
+    return -1;
+}
+
+extern "C" void gpu_batch_cleanup(int device_id)
+{
+    if (device_id < 0 || device_id >= MAX_DEVICES) return;
+    if (cudaSetDevice(device_id) != cudaSuccess) return;
+
+    BatchState *bs = &g_batch[device_id];
+    if (bs->d_data) { cudaFree(bs->d_data); bs->d_data = NULL; }
+    bs->data_capacity = 0;
+    free_count_buffers(bs);
+}
+
+/* ================================================================
  * Host functions
  * ================================================================ */
 extern "C" int gpu_compute_addresses(
@@ -48,6 +119,7 @@ extern "C" int gpu_compute_addresses(
     int            count,
     uint8_t       *addresses_out)
 {
+    if (device_id < 0 || device_id >= MAX_DEVICES) return -1;
     if (cudaSetDevice(device_id) != cudaSuccess) return -1;
     if (count <= 0) return 0;
 
@@ -58,40 +130,21 @@ extern "C" int gpu_compute_addresses(
     }
     if (max_data <= 0) max_data = 1;
 
-    uint8_t *d_data = NULL;
-    int     *d_off  = NULL;
-    int     *d_len  = NULL;
-    uint8_t *d_out  = NULL;
-    if (cudaMalloc(&d_data, (size_t)max_data)            != cudaSuccess) goto err;
-    if (cudaMalloc(&d_off,  (size_t)count * sizeof(int)) != cudaSuccess) goto err;
-    if (cudaMalloc(&d_len,  (size_t)count * sizeof(int)) != cudaSuccess) goto err;
-    if (cudaMalloc(&d_out,  (size_t)count * 20)          != cudaSuccess) goto err;
+    if (ensure_batch_buffers(device_id, max_data, count) != 0) return -1;
+    BatchState *state = &g_batch[device_id];
 
-    cudaMemcpy(d_data, mnemonic_data,    (size_t)max_data,            cudaMemcpyHostToDevice);
-    cudaMemcpy(d_off,  mnemonic_offsets, (size_t)count * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_len,  mnemonic_lengths, (size_t)count * sizeof(int), cudaMemcpyHostToDevice);
+    if (cudaMemcpy(state->d_data, mnemonic_data, (size_t)max_data, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(state->d_off, mnemonic_offsets, (size_t)count * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(state->d_len, mnemonic_lengths, (size_t)count * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
 
-    /* Default CUDA thread stack is 1024 bytes; the shared crypto pipeline
-     * needs the same stack headroom as enumerate. */
-    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
     {
-        int bs = 32;
-        int nb = (count + bs - 1) / bs;
-        tron_batch_kernel<<<nb, bs>>>(d_data, d_off, d_len, count, d_out);
-        if (cudaDeviceSynchronize() != cudaSuccess) goto err;
+        int block_size = 32;
+        int num_blocks = (count + block_size - 1) / block_size;
+        tron_batch_kernel<<<num_blocks, block_size>>>(
+            state->d_data, state->d_off, state->d_len, count, state->d_out);
+        if (cudaDeviceSynchronize() != cudaSuccess) return -1;
     }
 
-    cudaMemcpy(addresses_out, d_out, (size_t)count * 20, cudaMemcpyDeviceToHost);
-    cudaFree(d_data);
-    cudaFree(d_off);
-    cudaFree(d_len);
-    cudaFree(d_out);
+    if (cudaMemcpy(addresses_out, state->d_out, (size_t)count * 20, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
     return 0;
-
-err:
-    if (d_data) cudaFree(d_data);
-    if (d_off)  cudaFree(d_off);
-    if (d_len)  cudaFree(d_len);
-    if (d_out)  cudaFree(d_out);
-    return -1;
 }

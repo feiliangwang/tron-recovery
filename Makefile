@@ -62,6 +62,7 @@ internal/compute/libgpu_cuda.a: internal/compute/gpu_runtime.cu internal/compute
 		-I$(CUDA_INCLUDE) \
 		-c internal/compute/gpu_enumerate.cu \
 		-o internal/compute/gpu_enumerate.o
+	rm -f internal/compute/libgpu_cuda.a
 	ar rcs internal/compute/libgpu_cuda.a \
 		internal/compute/gpu_runtime.o \
 		internal/compute/gpu_batch.o \

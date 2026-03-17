@@ -15,6 +15,8 @@
 #include <string.h>
 #include "bip39_wordlist.h"
 
+extern "C" void gpu_batch_cleanup(int device_id);
+
 /* ================================================================
  * Byte-order helpers
  * ================================================================ */
@@ -1083,6 +1085,7 @@ extern "C" int gpu_bip39_debug(int device_id, const int16_t wi[12], uint8_t *sto
 extern "C" void gpu_enumerate_cleanup(int device_id)
 {
     if (cudaSetDevice(device_id) != cudaSuccess) return;
+    gpu_batch_cleanup(device_id);
     gpu_bloom_free(device_id);
     DeviceState *ds = &g_dev[device_id];
     if (ds->d_wi)          { cudaFree(ds->d_wi);          ds->d_wi          = NULL; }

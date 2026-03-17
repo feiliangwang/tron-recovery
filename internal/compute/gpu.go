@@ -61,14 +61,20 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
 	}
 	count := len(mnemonics)
 
-	// Flatten mnemonics into a single byte buffer
-	var flat []byte
+	// Flatten mnemonics into a single byte buffer with one allocation.
+	totalBytes := 0
+	for _, m := range mnemonics {
+		totalBytes += len(m)
+	}
+	flat := make([]byte, totalBytes)
 	offsets := make([]C.int, count)
 	lengths := make([]C.int, count)
+	pos := 0
 	for i, m := range mnemonics {
-		offsets[i] = C.int(len(flat))
+		offsets[i] = C.int(pos)
 		lengths[i] = C.int(len(m))
-		flat = append(flat, []byte(m)...)
+		copy(flat[pos:], m)
+		pos += len(m)
 	}
 	if len(flat) == 0 {
 		flat = []byte{0}
@@ -91,13 +97,7 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
 		return cpu.Compute(mnemonics)
 	}
 
-	result := make([][]byte, count)
-	for i := range result {
-		addr := make([]byte, 20)
-		copy(addr, addrBuf[i*20:(i+1)*20])
-		result[i] = addr
-	}
-	return result
+	return addressViews(addrBuf, count)
 }
 
 // EnumerateCompute performs BIP39 enumeration and TRON address derivation entirely on the GPU.
@@ -153,13 +153,20 @@ func (g *GPUComputer) EnumerateCompute(
 	if cnt > capacity {
 		cnt = capacity
 	}
-	addresses = make([][]byte, cnt)
-	for i := range addresses {
-		addr := make([]byte, 20)
-		copy(addr, outAddrs[i*20:(i+1)*20])
-		addresses[i] = addr
+	return outIdxs[:cnt:cnt], addressViews(outAddrs, cnt), nil
+}
+
+func addressViews(buf []byte, count int) [][]byte {
+	if count <= 0 {
+		return nil
 	}
-	return outIdxs[:cnt], addresses, nil
+	result := make([][]byte, count)
+	for i := 0; i < count; i++ {
+		start := i * 20
+		end := start + 20
+		result[i] = buf[start:end:end]
+	}
+	return result
 }
 
 // UploadBloomFilter uploads a bloom filter to persistent GPU memory on this device.
