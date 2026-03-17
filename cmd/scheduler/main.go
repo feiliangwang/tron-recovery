@@ -50,8 +50,9 @@ type jobSpeedEntry struct {
 
 // Server 服务器
 type Server struct {
-	taskManager *scheduler.TaskManager
-	matchesFile string // 匹配结果持久化文件路径
+	taskManager   *scheduler.TaskManager
+	matchesFile   string // 匹配结果持久化文件路径
+	confirmedFile string // 确认成功的地址持久化文件路径
 
 	jobs   map[string]*CompactJobRunner
 	jobsMu sync.RWMutex
@@ -61,6 +62,9 @@ type Server struct {
 
 	matches   []*Match
 	matchesMu sync.Mutex
+
+	confirmed   []*Match // 确认成功的地址列表
+	confirmedMu sync.Mutex
 
 	workers           map[string]*WorkerInfo
 	workersMu         sync.RWMutex
@@ -160,11 +164,13 @@ func main() {
 
 	// 创建服务器
 	server := &Server{
-		taskManager:  tm,
-		matchesFile:  filepath.Join(*dataDir, "matches.json"),
-		jobs:         make(map[string]*CompactJobRunner),
-		pendingTasks: make(map[int64]pendingTaskRecord),
-		workers:      make(map[string]*WorkerInfo),
+		taskManager:   tm,
+		matchesFile:   filepath.Join(*dataDir, "matches.json"),
+		confirmedFile: filepath.Join(*dataDir, "confirmed.json"),
+		jobs:          make(map[string]*CompactJobRunner),
+		pendingTasks:  make(map[int64]pendingTaskRecord),
+		workers:       make(map[string]*WorkerInfo),
+		confirmed:     make([]*Match, 0),
 	}
 
 	// 初始化账户数据库
@@ -184,6 +190,9 @@ func main() {
 	// 加载持久化的匹配结果
 	server.loadMatches()
 
+	// 加载持久化的确认成功地址
+	server.loadConfirmed()
+
 	// Worker清理
 	go server.cleanWorkers()
 
@@ -195,6 +204,7 @@ func main() {
 	http.HandleFunc("/api/task/fetch", server.handleTaskFetch)
 	http.HandleFunc("/api/task/submit", server.handleTaskSubmit)
 	http.HandleFunc("/api/matches", server.handleMatches)
+	http.HandleFunc("/api/confirmed", server.handleConfirmed)
 	http.HandleFunc("/api/workers", server.handleWorkers)
 	http.HandleFunc("/api/stats", server.handleStats)
 	http.HandleFunc("/api/bloom", server.handleBloomInfo)
@@ -769,6 +779,15 @@ func (s *Server) handleMatches(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"matches": matches})
 }
 
+// handleConfirmed 确认成功的地址
+func (s *Server) handleConfirmed(w http.ResponseWriter, r *http.Request) {
+	s.confirmedMu.Lock()
+	confirmed := s.confirmed
+	s.confirmedMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"confirmed": confirmed})
+}
+
 // handleWorkers Worker列表
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 	s.workersMu.RLock()
@@ -1082,6 +1101,56 @@ func (s *Server) loadMatches() {
 	log.Printf("[Matches] 已加载 %d 条匹配记录", len(matches))
 }
 
+// loadConfirmed 从磁盘恢复已确认成功的地址
+func (s *Server) loadConfirmed() {
+	if s.confirmedFile == "" {
+		return
+	}
+	data, err := os.ReadFile(s.confirmedFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[Confirmed] 读取失败: %v", err)
+		}
+		return
+	}
+
+	var confirmed []*Match
+	if err := json.Unmarshal(data, &confirmed); err != nil {
+		log.Printf("[Confirmed] 解析失败: %v", err)
+		return
+	}
+
+	// 从 RawAddrHex 恢复 rawAddr
+	for _, m := range confirmed {
+		if m.RawAddrHex != "" {
+			if b, err := hex.DecodeString(m.RawAddrHex); err == nil {
+				m.rawAddr = b
+			}
+		}
+	}
+
+	s.confirmedMu.Lock()
+	s.confirmed = confirmed
+	s.confirmedMu.Unlock()
+
+	log.Printf("[Confirmed] 已加载 %d 条确认成功记录", len(confirmed))
+}
+
+// saveConfirmedLocked 将确认成功的地址写入磁盘（调用前须持有 confirmedMu）
+func (s *Server) saveConfirmedLocked() {
+	if s.confirmedFile == "" {
+		return
+	}
+	data, err := json.MarshalIndent(s.confirmed, "", "  ")
+	if err != nil {
+		log.Printf("[Confirmed] 序列化失败: %v", err)
+		return
+	}
+	if err := os.WriteFile(s.confirmedFile, data, 0644); err != nil {
+		log.Printf("[Confirmed] 写入失败: %v", err)
+	}
+}
+
 // extractJobNum 提取job数字
 func extractJobNum(jobID string) int64 {
 	var num int64
@@ -1103,6 +1172,21 @@ func (s *Server) confirmMatch(m *Match) {
 	s.matchesMu.Unlock()
 
 	if exists {
+		// 添加到确认成功列表
+		s.confirmedMu.Lock()
+		// 检查是否已存在（避免重复）
+		found := false
+		for _, c := range s.confirmed {
+			if c.Address == m.Address {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.confirmed = append(s.confirmed, m)
+			s.saveConfirmedLocked()
+		}
+		s.confirmedMu.Unlock()
 		log.Printf("[Confirm] ✅ 账户存在 %s", m.Address)
 	} else {
 		log.Printf("[Confirm] ❌ 账户不存在 %s", m.Address)

@@ -535,8 +535,12 @@
         }
 
         async function refreshMatches() {
-            const data = await fetchAPI('/matches');
-            const matches = data.matches || [];
+            const [matchesData, confirmedData] = await Promise.all([
+                fetchAPI('/matches'),
+                fetchAPI('/confirmed'),
+            ]);
+            const matches = matchesData.matches || [];
+            const confirmed = confirmedData.confirmed || [];
 
             // 稳定排序：按首次出现顺序，新匹配追加
             const matchMap = {};
@@ -544,8 +548,7 @@
             matches.forEach(m => { if (!matchOrder.includes(m.address)) matchOrder.push(m.address); });
             const stableMatches = matchOrder.filter(a => matchMap[a]).map(a => matchMap[a]);
 
-            // 分类：已激活 / 全部（取最新20条，但顺序固定）
-            const confirmed = stableMatches.filter(m => m.confirmed === true);
+            // 全部（取最新20条，但顺序固定）
             const allRecent = stableMatches.slice(-20).reverse();
 
             // 统计
@@ -558,13 +561,11 @@
                 confirmedPanel.style.display = '';
                 document.getElementById('confirmed-count').textContent = `${confirmed.length} 个`;
                 confirmedList.innerHTML = confirmed.map(m => {
-                    const ct = m.create_time > 0
-                        ? new Date(m.create_time).toLocaleString()
-                        : '';
+                    const ct = m.time ? new Date(m.time).toLocaleString() : '';
                     return `
                         <div class="confirmed-item">
                             <div class="match-address">🏆 ${m.address}</div>
-                            ${ct ? `<div class="match-create-time">创建时间: ${ct}</div>` : ''}
+                            ${ct ? `<div class="match-create-time">发现时间: ${ct}</div>` : ''}
                             <div class="match-mnemonic">${m.mnemonic}</div>
                         </div>`;
                 }).join('');
@@ -579,16 +580,17 @@
                 return;
             }
 
+            // 构建已确认地址集合用于快速查询
+            const confirmedSet = new Set(confirmed.map(m => m.address));
+
             list.innerHTML = allRecent.map(m => {
                 let badge, badgeClass;
-                if (m.confirm_err) {
-                    badge = '⚠️ 查询失败'; badgeClass = 'badge-error';
-                } else if (m.confirmed === null || m.confirmed === undefined) {
-                    badge = '⏳ 待确认'; badgeClass = 'badge-pending';
-                } else if (m.confirmed === true) {
+                if (confirmedSet.has(m.address)) {
                     badge = '✅ 已激活'; badgeClass = 'badge-active';
-                } else {
+                } else if (m.exists === false) {
                     badge = '⬜ 未激活'; badgeClass = 'badge-inactive';
+                } else {
+                    badge = '⏳ 待确认'; badgeClass = 'badge-pending';
                 }
                 return `
                     <div class="match-item">
