@@ -595,12 +595,14 @@ int gpu_device_count(void){
 }
 
 int gpu_compute_addresses(
+        int            device_id,
         const uint8_t *mnemonic_data,
         const int     *mnemonic_offsets,
         const int     *mnemonic_lengths,
         int            count,
         uint8_t       *addresses_out)
 {
+    if(cudaSetDevice(device_id)!=cudaSuccess) return -1;
     if(count<=0) return 0;
 
     int max_data=0;

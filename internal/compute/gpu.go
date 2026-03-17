@@ -17,16 +17,42 @@ import (
 )
 
 // GPUComputer GPU计算器（CUDA版本）
-type GPUComputer struct{}
+type GPUComputer struct {
+	deviceID int
+}
 
-// NewGPUComputer 创建GPU计算器
-func NewGPUComputer() (*GPUComputer, error) {
+// GPUDeviceCount 返回可用 CUDA 设备数量
+func GPUDeviceCount() int {
+	return int(C.gpu_device_count())
+}
+
+// NewGPUComputer 创建指定设备的GPU计算器
+func NewGPUComputer(deviceID int) (*GPUComputer, error) {
 	n := int(C.gpu_device_count())
 	if n <= 0 {
 		return nil, fmt.Errorf("no CUDA-capable devices found")
 	}
-	return &GPUComputer{}, nil
+	if deviceID < 0 || deviceID >= n {
+		return nil, fmt.Errorf("device %d not available (found %d device(s))", deviceID, n)
+	}
+	return &GPUComputer{deviceID: deviceID}, nil
 }
+
+// NewGPUComputerAll 创建所有可用 GPU 设备的计算器列表
+func NewGPUComputerAll() ([]*GPUComputer, error) {
+	n := int(C.gpu_device_count())
+	if n <= 0 {
+		return nil, fmt.Errorf("no CUDA-capable devices found")
+	}
+	result := make([]*GPUComputer, n)
+	for i := range result {
+		result[i] = &GPUComputer{deviceID: i}
+	}
+	return result, nil
+}
+
+// DeviceID 返回该计算器绑定的 GPU 设备 ID
+func (g *GPUComputer) DeviceID() int { return g.deviceID }
 
 // Compute 计算助记词对应的TRON地址（GPU版本）
 func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
@@ -51,6 +77,7 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
 	addrBuf := make([]byte, count*20)
 
 	ret := C.gpu_compute_addresses(
+		C.int(g.deviceID),
 		(*C.uint8_t)(unsafe.Pointer(&flat[0])),
 		(*C.int)(unsafe.Pointer(&offsets[0])),
 		(*C.int)(unsafe.Pointer(&lengths[0])),
@@ -107,6 +134,7 @@ func (g *GPUComputer) EnumerateCompute(
 	var outCount C.int
 
 	ret := C.gpu_enumerate_compute(
+		C.int(g.deviceID),
 		C.int64_t(startIdx),
 		C.int64_t(endIdx),
 		(*C.int16_t)(unsafe.Pointer(&knownC[0])),
@@ -118,7 +146,7 @@ func (g *GPUComputer) EnumerateCompute(
 		&outCount,
 	)
 	if int(ret) < 0 {
-		return nil, nil, fmt.Errorf("gpu_enumerate_compute failed")
+		return nil, nil, fmt.Errorf("gpu_enumerate_compute failed (device %d)", g.deviceID)
 	}
 
 	cnt := int(outCount)
@@ -134,7 +162,7 @@ func (g *GPUComputer) EnumerateCompute(
 	return outIdxs[:cnt], addresses, nil
 }
 
-// UploadBloomFilter uploads a bloom filter to persistent GPU memory.
+// UploadBloomFilter uploads a bloom filter to persistent GPU memory on this device.
 // Once uploaded, gpu_enumerate_compute will filter addresses on the GPU,
 // returning only bloom-matching results and eliminating GPU→CPU address transfer.
 func (g *GPUComputer) UploadBloomFilter(f *bloom.Filter) error {
@@ -143,13 +171,14 @@ func (g *GPUComputer) UploadBloomFilter(f *bloom.Filter) error {
 		return nil
 	}
 	ret := C.gpu_bloom_upload(
+		C.int(g.deviceID),
 		(*C.uint64_t)(unsafe.Pointer(&words[0])),
 		C.uint64_t(len(words)),
 		C.uint64_t(m),
 		C.uint32_t(k),
 	)
 	if int(ret) < 0 {
-		return fmt.Errorf("gpu_bloom_upload failed")
+		return fmt.Errorf("gpu_bloom_upload failed (device %d)", g.deviceID)
 	}
 	return nil
 }
@@ -160,7 +189,7 @@ func (g *GPUComputer) BloomTestAddr(addr []byte) bool {
 	if len(addr) != 20 {
 		panic("BloomTestAddr: address must be 20 bytes")
 	}
-	ret := C.gpu_bloom_test_addr((*C.uint8_t)(unsafe.Pointer(&addr[0])))
+	ret := C.gpu_bloom_test_addr(C.int(g.deviceID), (*C.uint8_t)(unsafe.Pointer(&addr[0])))
 	return int(ret) == 1
 }
 
@@ -173,17 +202,18 @@ func (g *GPUComputer) BIP39Debug(wordIndices [12]int16) (storedCS, sha0 byte, er
 	}
 	var cStored, cSha C.uint8_t
 	ret := C.gpu_bip39_debug(
+		C.int(g.deviceID),
 		(*C.int16_t)(unsafe.Pointer(&wiC[0])),
 		&cStored, &cSha,
 	)
 	if int(ret) < 0 {
-		return 0, 0, fmt.Errorf("gpu_bip39_debug failed")
+		return 0, 0, fmt.Errorf("gpu_bip39_debug failed (device %d)", g.deviceID)
 	}
 	return byte(cStored), byte(cSha), nil
 }
 
 // Close 关闭GPU计算器，释放持久化GPU内存
 func (g *GPUComputer) Close() error {
-	C.gpu_enumerate_cleanup()
+	C.gpu_enumerate_cleanup(C.int(g.deviceID))
 	return nil
 }

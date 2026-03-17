@@ -1,8 +1,7 @@
 package main
 
 import (
-	"bufio"
-	"encoding/hex"
+	"boon/internal/account"
 	"flag"
 	"fmt"
 	"os"
@@ -21,7 +20,7 @@ func main() {
 	flag.Parse()
 
 	if *inputFile == "" {
-		fmt.Println("用法: bloomtool -input addresses.txt -output bloom.gob")
+		fmt.Println("用法: bloomtool -input leveldb -output bloom.gob")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -29,47 +28,16 @@ func main() {
 	fmt.Printf("读取地址文件: %s\n", *inputFile)
 
 	// 读取所有地址
-	file, err := os.Open(*inputFile)
+	db, err := account.NewAccountDb(*inputFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "打开文件失败: %v\n", err)
 		os.Exit(1)
 	}
-	defer file.Close()
-
-	var addresses [][]byte
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) == 0 {
-			continue
-		}
-
-		addr, err := hex.DecodeString(line)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "跳过无效地址: %s (err: %v)\n", line, err)
-			continue
-		}
-
-		if len(addr) == 20 {
-			addresses = append(addresses, addr)
-		}
-	}
-
-	if len(addresses) == 0 {
-		fmt.Fprintln(os.Stderr, "没有有效的地址")
-		os.Exit(1)
-	}
-
-	fmt.Printf("读取到 %d 个有效地址\n", len(addresses))
-
-	// 创建Bloom过滤器
 	start := time.Now()
-	filter := bloom.NewFilter(uint(len(addresses)*2), *falseRate)
-
-	for _, addr := range addresses {
-		filter.Add(addr)
-	}
-
+	filter := bloom.NewFilter(uint(db.Count()*2), *falseRate)
+	db.IteratorAccount(func(addr20 []byte) {
+		filter.Add(addr20)
+	})
 	fmt.Printf("Bloom过滤器创建完成，耗时: %v\n", time.Since(start))
 
 	// 保存到文件

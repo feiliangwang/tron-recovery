@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,17 +26,18 @@ import (
 )
 
 var (
-	schedulerURL  = flag.String("scheduler", "http://192.168.3.250", "调度服务器地址")
-	workerID      = flag.String("id", "", "Worker ID（留空自动生成）")
-	workers       = flag.Int("workers", runtime.NumCPU(), "并发计算线程数")
-	bloomFile     = flag.String("bloom", "account.bin.bloom", "Bloom过滤器文件（本地加载）")
-	useGPU        = flag.Bool("gpu", false, "使用GPU加速（需要CUDA构建）")
-	benchN        = flag.Int("bench", 0, "测速模式：随机生成N个助记词测算计算速度（0=禁用）")
-	verifyN       = flag.Int("verify", 0, "验证模式：随机生成N个助记词对比GPU与CPU结果（0=禁用）")
-	benchFullN    = flag.Int64("bench-full", 0, "全链路测速：模拟完整枚举→验证→计算流程，扫描N个索引（0=禁用）")
-	bloomTestMnem = flag.String("bloom-test", "", "Bloom过滤器验证：给定助记词，对比CPU与GPU bloom结果")
-	enumTestMnem  = flag.String("enum-test", "", "枚举验证：给定完整助记词+模板，验证CPU/GPU索引转换是否正确（配合-template使用）")
-	enumTemplate  = flag.String("template", "", "枚举验证用的模板（未知词用?，如 'word1 ? ? word4 ...'）")
+	schedulerURL   = flag.String("scheduler", "http://192.168.3.250", "调度服务器地址")
+	workerID       = flag.String("id", "", "Worker ID（留空自动生成）")
+	workers        = flag.Int("workers", runtime.NumCPU(), "并发计算线程数（CPU模式）")
+	bloomFile      = flag.String("bloom", "account.bin.bloom", "Bloom过滤器文件（本地加载）")
+	useGPU         = flag.Bool("gpu", false, "使用全部可用GPU（等价于 -gpu-devices all）")
+	gpuDevices     = flag.String("gpu-devices", "", "指定GPU设备列表，如 '0,1,2' 或 'all'（覆盖 -gpu 标志）")
+	benchN         = flag.Int("bench", 0, "测速模式：随机生成N个助记词测算计算速度（0=禁用）")
+	verifyN        = flag.Int("verify", 0, "验证模式：随机生成N个助记词对比GPU与CPU结果（0=禁用）")
+	benchFullN     = flag.Int64("bench-full", 0, "全链路测速：模拟完整枚举→验证→计算流程，扫描N个索引（0=禁用）")
+	bloomTestMnem  = flag.String("bloom-test", "", "Bloom过滤器验证：给定助记词，对比CPU与GPU bloom结果")
+	enumTestMnem   = flag.String("enum-test", "", "枚举验证：给定完整助记词+模板，验证CPU/GPU索引转换是否正确（配合-template使用）")
+	enumTemplate   = flag.String("template", "", "枚举验证用的模板（未知词用?，如 'word1 ? ? word4 ...'）")
 	bip39DebugMnem = flag.String("bip39-debug", "", "BIP39 GPU调试：验证GPU checksum计算（需要-gpu）")
 )
 
@@ -95,46 +98,21 @@ func main() {
 		log.Println("Bloom过滤器加载完成")
 	}
 
+	// 解析目标 GPU 设备列表
+	deviceIDs := parseGPUDevices(*gpuDevices, *useGPU)
+
 	log.Printf("========================================")
 	log.Printf("  Boon Worker v2 (紧凑协议)")
 	log.Printf("========================================")
 	log.Printf("  ID:           %s", id)
 	log.Printf("  调度服务器:    %s", *schedulerURL)
-	log.Printf("  计算线程:      %d", *workers)
 	log.Printf("  Bloom过滤:     %s", boolStr(bloomFilter != nil, "已加载", "未加载"))
-	log.Printf("  GPU加速:       %s", boolStr(*useGPU, "启用", "禁用"))
-	log.Printf("========================================")
-
-	var seedComp compute.SeedComputer
-	gpuMode := false
-	if *useGPU {
-		gpu, err := compute.NewGPUComputer()
-		if err != nil {
-			log.Printf("GPU初始化失败，回退到CPU: %v", err)
-			seedComp = compute.NewCPUComputer()
-		} else {
-			log.Printf("GPU计算器初始化成功")
-			seedComp = gpu
-			gpuMode = true
-		}
+	if len(deviceIDs) == 0 {
+		log.Printf("  计算模式:      CPU (%d线程)", *workers)
 	} else {
-		seedComp = compute.NewCPUComputer()
+		log.Printf("  计算模式:      GPU x%d (设备 %v)", len(deviceIDs), deviceIDs)
 	}
-
-	client := worker.NewCompactClient(*schedulerURL)
-	// GPU 模式：workers=1（避免并发调用 CUDA）；CPU 模式：使用指定并发数
-	effectiveWorkers := *workers
-	if gpuMode {
-		effectiveWorkers = 1
-	}
-	w := worker.NewCompactWorkerWithComputer(id, client, effectiveWorkers, seedComp)
-	if gpuMode {
-		// GPU 最优批次大小 65536，单次大批量调用效率最高
-		w.SetBatchSize(65536)
-		// 多 CPU 核并行枚举，与 GPU 计算流水线重叠
-		w.SetEnumWorkers(runtime.NumCPU())
-	}
-	w.SetBloomFilter(bloomFilter)
+	log.Printf("========================================")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -147,18 +125,142 @@ func main() {
 		cancel()
 	}()
 
-	// 启动前自测速，预填速度窗口，让第一次任务请求即携带准确速度
-	w.Warmup()
-
 	startTime := time.Now()
-	w.Start(ctx)
-	<-ctx.Done()
-	w.Stop()
+
+	switch len(deviceIDs) {
+	case 0:
+		// CPU 模式
+		runCPUWorker(ctx, id, bloomFilter, *workers)
+
+	case 1:
+		// 单 GPU 模式（保留原有行为）
+		runGPUWorkers(ctx, id, bloomFilter, deviceIDs)
+
+	default:
+		// 多 GPU 模式
+		runGPUWorkers(ctx, id, bloomFilter, deviceIDs)
+	}
 
 	elapsed := time.Since(startTime)
 	log.Printf("========================================")
 	log.Printf("  Worker 已停止，运行时间: %v", elapsed)
 	log.Printf("========================================")
+}
+
+// runCPUWorker 启动 CPU 模式 worker
+func runCPUWorker(ctx context.Context, id string, bloomFilter *bloom.Filter, numWorkers int) {
+	seedComp := compute.NewCPUComputer()
+	client := worker.NewCompactClient(*schedulerURL)
+	w := worker.NewCompactWorkerWithComputer(id, client, numWorkers, seedComp)
+	w.SetBloomFilter(bloomFilter)
+	w.Warmup()
+	w.Start(ctx)
+	<-ctx.Done()
+	w.Stop()
+}
+
+// runGPUWorkers 启动一个或多个 GPU worker（每个设备一个独立 goroutine）
+func runGPUWorkers(ctx context.Context, baseID string, bloomFilter *bloom.Filter, deviceIDs []int) {
+	// 每个 GPU 分配的 CPU 枚举线程数
+	cpuPerGPU := runtime.NumCPU() / len(deviceIDs)
+	if cpuPerGPU < 1 {
+		cpuPerGPU = 1
+	}
+
+	var wg sync.WaitGroup
+	activeWorkers := make([]*worker.CompactWorker, 0, len(deviceIDs))
+	var mu sync.Mutex
+
+	for _, devID := range deviceIDs {
+		gpu, err := compute.NewGPUComputer(devID)
+		if err != nil {
+			log.Printf("GPU %d 初始化失败，跳过: %v", devID, err)
+			continue
+		}
+
+		wID := baseID
+		if len(deviceIDs) > 1 {
+			wID = fmt.Sprintf("%s-gpu%d", baseID, devID)
+		}
+
+		client := worker.NewCompactClient(*schedulerURL)
+		w := worker.NewCompactWorkerWithComputer(wID, client, 1, gpu)
+		w.SetBatchSize(65536)
+		w.SetEnumWorkers(cpuPerGPU)
+		w.SetBloomFilter(bloomFilter)
+
+		mu.Lock()
+		activeWorkers = append(activeWorkers, w)
+		mu.Unlock()
+
+		log.Printf("[GPU %d] Worker %s 初始化成功，CPU枚举线程: %d", devID, wID, cpuPerGPU)
+	}
+
+	if len(activeWorkers) == 0 {
+		log.Printf("所有 GPU 初始化失败，退出")
+		return
+	}
+
+	// 并行热身
+	log.Printf("并行热身 %d 个 GPU worker...", len(activeWorkers))
+	var warmupWg sync.WaitGroup
+	for _, w := range activeWorkers {
+		warmupWg.Add(1)
+		go func(w *worker.CompactWorker) {
+			defer warmupWg.Done()
+			w.Warmup()
+		}(w)
+	}
+	warmupWg.Wait()
+
+	// 启动所有 worker
+	for _, w := range activeWorkers {
+		wg.Add(1)
+		go func(w *worker.CompactWorker) {
+			defer wg.Done()
+			w.Start(ctx)
+			<-ctx.Done()
+			w.Stop()
+		}(w)
+	}
+
+	wg.Wait()
+}
+
+// parseGPUDevices 解析 GPU 设备列表
+// devStr: "" | "all" | "0,1,2"
+// legacyGPU: -gpu 标志（等价于 "all"）
+func parseGPUDevices(devStr string, legacyGPU bool) []int {
+	if devStr == "" && !legacyGPU {
+		return nil
+	}
+
+	total := compute.GPUDeviceCount()
+	if total == 0 {
+		log.Printf("未检测到 CUDA 设备（可能未使用 -tags cuda 编译）")
+		return nil
+	}
+
+	if devStr == "" || devStr == "all" {
+		ids := make([]int, total)
+		for i := range ids {
+			ids[i] = i
+		}
+		return ids
+	}
+
+	parts := strings.Split(devStr, ",")
+	var ids []int
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		id, err := strconv.Atoi(p)
+		if err != nil || id < 0 || id >= total {
+			log.Printf("无效的GPU设备ID: %q（系统共 %d 个设备）", p, total)
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // ================================================================
@@ -177,12 +279,12 @@ func runBench(total int, gpu bool, cpuWorkers int) {
 	var comp compute.SeedComputer
 	compName := "CPU"
 	if gpu {
-		g, err := compute.NewGPUComputer()
+		g, err := compute.NewGPUComputer(0)
 		if err != nil {
 			log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 		}
 		comp = g
-		compName = "GPU"
+		compName = "GPU(device 0)"
 	} else {
 		comp = compute.NewCPUComputer()
 		compName = fmt.Sprintf("CPU(单线程)")
@@ -229,7 +331,7 @@ func runBench(total int, gpu bool, cpuWorkers int) {
 // ================================================================
 
 func runVerify(total int, cpuWorkers int) {
-	gpuComp, err := compute.NewGPUComputer()
+	gpuComp, err := compute.NewGPUComputer(0)
 	if err != nil {
 		log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 	}
@@ -314,12 +416,12 @@ func runBenchFull(total int64, gpu bool, cpuWorkers int) {
 	var seedComp compute.SeedComputer
 	compName := "CPU"
 	if gpu {
-		g, err := compute.NewGPUComputer()
+		g, err := compute.NewGPUComputer(0)
 		if err != nil {
 			log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 		}
 		seedComp = g
-		compName = "GPU"
+		compName = "GPU(device 0)"
 	} else {
 		seedComp = compute.NewCPUComputer()
 	}
@@ -451,8 +553,8 @@ func runBloomTest(mnemonic, bloomFilePath string) {
 	cpuAddr := cpuAddrs[0]
 	fmt.Printf("CPU 地址:  %s\n", hex.EncodeToString(cpuAddr))
 
-	// 2. GPU 计算地址
-	gpuCompConcrete, err := compute.NewGPUComputer()
+	// 2. GPU 计算地址（使用设备 0）
+	gpuCompConcrete, err := compute.NewGPUComputer(0)
 	if err != nil {
 		log.Fatalf("GPU 初始化失败: %v", err)
 	}
@@ -541,7 +643,7 @@ func runBIP39Debug(mnemonic string) {
 		fmt.Printf("  wi[%d] = %d (%s)\n", i, idx, w)
 	}
 
-	gpuRaw, err := compute.NewGPUComputer()
+	gpuRaw, err := compute.NewGPUComputer(0)
 	if err != nil {
 		log.Fatalf("GPU 初始化失败: %v", err)
 	}
@@ -659,8 +761,8 @@ func runEnumTest(targetMnemonic, template, bloomFilePath string) {
 	cpuAddr := cpuComp.Compute([]string{strings.Join(cpuWords, " ")})[0]
 	fmt.Printf("  CPU 地址: %s\n\n", hex.EncodeToString(cpuAddr))
 
-	// GPU 枚举（通过接口断言访问 EnumerateCompute）
-	gpuRaw, err := compute.NewGPUComputer()
+	// GPU 枚举（使用设备 0，通过接口断言访问 EnumerateCompute）
+	gpuRaw, err := compute.NewGPUComputer(0)
 	if err != nil {
 		log.Fatalf("GPU 初始化失败: %v", err)
 	}
