@@ -130,8 +130,8 @@ __device__ void en_sha512_final(en_sha512_ctx *c, uint8_t out[64]){
  * that causes 664 bytes of Local Memory spills per pbkdf2 call.
  * The W schedule is built entirely in registers (no block[128]).
  * ================================================================ */
-__device__ __forceinline__ void sha512_resume_64(
-    const uint64_t st[8], const uint8_t d[64], uint8_t out[64])
+__device__ __forceinline__ void sha512_resume_64_words(
+    const uint64_t st[8], const uint64_t d[8], uint64_t out[8])
 {
     uint64_t h0=st[0],h1=st[1],h2=st[2],h3=st[3];
     uint64_t h4=st[4],h5=st[5],h6=st[6],h7=st[7];
@@ -142,7 +142,8 @@ __device__ __forceinline__ void sha512_resume_64(
     /* W[14]  = 0   (high 64 bits of bit-length)                    */
     /* W[15]  = 1536 (192 bytes × 8 bits)                           */
     uint64_t W[16];
-    for (int i = 0; i < 8; i++) W[i] = ec_load_be64(d + i * 8);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) W[i] = d[i];
     W[8]  = 0x8000000000000000ULL;
     W[9]  = 0; W[10] = 0; W[11] = 0; W[12] = 0; W[13] = 0;
     W[14] = 0; W[15] = 1536ULL;
@@ -156,11 +157,68 @@ __device__ __forceinline__ void sha512_resume_64(
         uint64_t t2 = EN_S0(a) + EN_MAJ(a,b,c);
         hh=g;g=f;f=e;e=d_+t1;d_=c;c=b;b=a;a=t1+t2;
     }
-    h0+=a;h1+=b;h2+=c;h3+=d_;h4+=e;h5+=f;h6+=g;h7+=hh;
-    ec_store_be64(out,    h0); ec_store_be64(out+8,  h1);
-    ec_store_be64(out+16, h2); ec_store_be64(out+24, h3);
-    ec_store_be64(out+32, h4); ec_store_be64(out+40, h5);
-    ec_store_be64(out+48, h6); ec_store_be64(out+56, h7);
+
+    out[0] = h0 + a; out[1] = h1 + b; out[2] = h2 + c; out[3] = h3 + d_;
+    out[4] = h4 + e; out[5] = h5 + f; out[6] = h6 + g; out[7] = h7 + hh;
+}
+
+__device__ __forceinline__ void sha512_resume_mnemonic1(
+    const uint64_t st[8], uint64_t out[8])
+{
+    uint64_t h0=st[0],h1=st[1],h2=st[2],h3=st[3];
+    uint64_t h4=st[4],h5=st[5],h6=st[6],h7=st[7];
+
+    uint64_t W[16];
+    W[0]  = 0x6d6e656d6f6e6963ULL; /* "mnemonic" */
+    W[1]  = 0x0000000180000000ULL;
+    W[2]  = 0; W[3]  = 0; W[4]  = 0; W[5]  = 0;
+    W[6]  = 0; W[7]  = 0; W[8]  = 0; W[9]  = 0;
+    W[10] = 0; W[11] = 0; W[12] = 0; W[13] = 0;
+    W[14] = 0; W[15] = 1120ULL;
+
+    uint64_t a=h0,b=h1,c=h2,d_=h3,e=h4,f=h5,g=h6,hh=h7;
+    #pragma unroll 8
+    for (int i = 0; i < 80; i++) {
+        if (i >= 16)
+            W[i&15] = EN_G1(W[(i-2)&15]) + EN_G0(W[(i-15)&15]) + W[(i-7)&15] + W[i&15];
+        uint64_t t1 = hh + EN_S1(e) + EN_CH(e,f,g) + EN_SHA512_K[i] + W[i&15];
+        uint64_t t2 = EN_S0(a) + EN_MAJ(a,b,c);
+        hh=g;g=f;f=e;e=d_+t1;d_=c;c=b;b=a;a=t1+t2;
+    }
+    out[0] = h0 + a; out[1] = h1 + b; out[2] = h2 + c; out[3] = h3 + d_;
+    out[4] = h4 + e; out[5] = h5 + f; out[6] = h6 + g; out[7] = h7 + hh;
+}
+
+__device__ __forceinline__ void sha512_init_key_pad_state(
+    const uint8_t *pw, uint32_t pwlen, uint8_t xorb, uint64_t out[8])
+{
+    uint64_t h0=0x6a09e667f3bcc908ULL,h1=0xbb67ae8584caa73bULL;
+    uint64_t h2=0x3c6ef372fe94f82bULL,h3=0xa54ff53a5f1d36f1ULL;
+    uint64_t h4=0x510e527fade682d1ULL,h5=0x9b05688c2b3e6c1fULL;
+    uint64_t h6=0x1f83d9abfb41bd6bULL,h7=0x5be0cd19137e2179ULL;
+
+    uint64_t fill = (uint64_t)xorb * 0x0101010101010101ULL;
+    uint64_t W[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) W[i] = fill;
+    for (uint32_t i = 0; i < pwlen; i++) {
+        int shift = (7 - (int)(i & 7)) * 8;
+        uint64_t mask = 0xFFULL << shift;
+        uint64_t bytev = (uint64_t)(pw[i] ^ xorb) << shift;
+        W[i >> 3] = (W[i >> 3] & ~mask) | bytev;
+    }
+
+    uint64_t a=h0,b=h1,c=h2,d_=h3,e=h4,f=h5,g=h6,hh=h7;
+    #pragma unroll 8
+    for (int i = 0; i < 80; i++) {
+        if (i >= 16)
+            W[i&15] = EN_G1(W[(i-2)&15]) + EN_G0(W[(i-15)&15]) + W[(i-7)&15] + W[i&15];
+        uint64_t t1 = hh + EN_S1(e) + EN_CH(e,f,g) + EN_SHA512_K[i] + W[i&15];
+        uint64_t t2 = EN_S0(a) + EN_MAJ(a,b,c);
+        hh=g;g=f;f=e;e=d_+t1;d_=c;c=b;b=a;a=t1+t2;
+    }
+    out[0] = h0 + a; out[1] = h1 + b; out[2] = h2 + c; out[3] = h3 + d_;
+    out[4] = h4 + e; out[5] = h5 + f; out[6] = h6 + g; out[7] = h7 + hh;
 }
 
 __device__ __noinline__ void en_hmac_sha512(
@@ -182,66 +240,32 @@ __device__ __noinline__ void en_hmac_sha512(
 __device__ __noinline__ void en_pbkdf2_hmac_sha512(
         const uint8_t *pw, uint32_t pwlen, uint8_t dk[64])
 {
-    /* Build key block: mnemonic padded/hashed to 128 bytes */
-    uint8_t k[128]; memset(k, 0, 128);
-    if (pwlen > 128) {
-        en_sha512_ctx t; en_sha512_init(&t);
-        en_sha512_update(&t, pw, pwlen); en_sha512_final(&t, k);
-    } else {
-        memcpy(k, pw, pwlen);
-    }
-
     /* Compute ipad/opad mid-states: compress the 128-byte pad blocks once.
      * Store only the 8-word state (64 B), not the full ctx (200 B).
      * This eliminates 664 B of Local Memory spills in the hot loop. */
     uint64_t ipad_st[8], opad_st[8];
-    {
-        uint8_t pad[128];
-        for (int i = 0; i < 128; i++) pad[i] = k[i] ^ 0x36;
-        uint64_t h[8] = {
-            0x6a09e667f3bcc908ULL,0xbb67ae8584caa73bULL,
-            0x3c6ef372fe94f82bULL,0xa54ff53a5f1d36f1ULL,
-            0x510e527fade682d1ULL,0x9b05688c2b3e6c1fULL,
-            0x1f83d9abfb41bd6bULL,0x5be0cd19137e2179ULL };
-        en_sha512_compress(h, pad);
-        for (int i = 0; i < 8; i++) ipad_st[i] = h[i];
-
-        for (int i = 0; i < 128; i++) pad[i] = k[i] ^ 0x5c;
-        h[0]=0x6a09e667f3bcc908ULL;h[1]=0xbb67ae8584caa73bULL;
-        h[2]=0x3c6ef372fe94f82bULL;h[3]=0xa54ff53a5f1d36f1ULL;
-        h[4]=0x510e527fade682d1ULL;h[5]=0x9b05688c2b3e6c1fULL;
-        h[6]=0x1f83d9abfb41bd6bULL;h[7]=0x5be0cd19137e2179ULL;
-        en_sha512_compress(h, pad);
-        for (int i = 0; i < 8; i++) opad_st[i] = h[i];
-    }
+    sha512_init_key_pad_state(pw, pwlen, 0x36, ipad_st);
+    sha512_init_key_pad_state(pw, pwlen, 0x5c, opad_st);
 
     /* First HMAC: msg = "mnemonic\0\0\0\1" (12 bytes).
      * Inner: sha512(ipad_st || salt[12]) — total 140 bytes = 1120 bits.
      * Pad block: [salt[0..11]][0x80][zeros...][0x0000000000000460] */
-    uint8_t U[64], T[64], inner[64];
-    {
-        uint64_t h[8];
-        for (int i = 0; i < 8; i++) h[i] = ipad_st[i];
-        uint8_t blk[128];
-        const uint8_t sb[12] = {'m','n','e','m','o','n','i','c',0,0,0,1};
-        for (int i = 0; i < 12; i++) blk[i] = sb[i];
-        blk[12] = 0x80;
-        for (int i = 13; i < 126; i++) blk[i] = 0;
-        blk[126] = 0x04; blk[127] = 0x60;   /* 1120 bits big-endian */
-        en_sha512_compress(h, blk);
-        for (int i = 0; i < 8; i++) ec_store_be64(inner + i*8, h[i]);
-    }
-    /* Outer: sha512(opad_st || inner[64]) via sha512_resume_64 */
-    sha512_resume_64(opad_st, inner, U);
-    memcpy(T, U, 64);
+    uint64_t U[8], T[8], inner[8];
+    sha512_resume_mnemonic1(ipad_st, inner);
+    /* Outer: sha512(opad_st || inner[64]) via sha512_resume_64_words */
+    sha512_resume_64_words(opad_st, inner, U);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) T[j] = U[j];
 
     /* Hot loop: 2047 iterations, 2 compressions each (no ctx copies) */
     for (int i = 1; i < 2048; i++) {
-        sha512_resume_64(ipad_st, U,     inner);
-        sha512_resume_64(opad_st, inner, U);
-        for (int j = 0; j < 64; j++) T[j] ^= U[j];
+        sha512_resume_64_words(ipad_st, U,     inner);
+        sha512_resume_64_words(opad_st, inner, U);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) T[j] ^= U[j];
     }
-    memcpy(dk, T, 64);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) ec_store_be64(dk + j * 8, T[j]);
 }
 
 /* ================================================================

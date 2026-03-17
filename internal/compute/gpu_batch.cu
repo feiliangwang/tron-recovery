@@ -6,6 +6,10 @@
  * remains isolated and multi-GPU host ABI stays unchanged.
  */
 
+#ifndef PBKDF2_BLOCK_SIZE
+#define PBKDF2_BLOCK_SIZE 256
+#endif
+
 #define GPU_ENUMERATE_SHARED_ONLY
 #undef __device__
 #define __device__ static __attribute__((device))
@@ -195,7 +199,7 @@ extern "C" int gpu_compute_pbkdf2_seeds(
     if (cudaMemcpy(state->d_len, mnemonic_lengths, (size_t)count * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
 
     {
-        int block_size = 256;
+        int block_size = PBKDF2_BLOCK_SIZE;
         int num_blocks = (count + block_size - 1) / block_size;
         pbkdf2_batch_kernel<<<num_blocks, block_size>>>(
             state->d_data, state->d_off, state->d_len, count, state->d_seed);
@@ -204,4 +208,68 @@ extern "C" int gpu_compute_pbkdf2_seeds(
 
     if (cudaMemcpy(seeds_out, state->d_seed, (size_t)count * 64, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
     return 0;
+}
+
+extern "C" int gpu_benchmark_pbkdf2_kernel(
+    int            device_id,
+    const uint8_t *mnemonic_data,
+    const int     *mnemonic_offsets,
+    const int     *mnemonic_lengths,
+    int            count,
+    int            rounds,
+    float         *kernel_ms_out,
+    uint64_t      *sample_out)
+{
+    if (device_id < 0 || device_id >= MAX_DEVICES) return -1;
+    if (cudaSetDevice(device_id) != cudaSuccess) return -1;
+    if (count <= 0 || rounds <= 0) return -1;
+
+    int max_data = 0;
+    for (int i = 0; i < count; i++) {
+        int end = mnemonic_offsets[i] + mnemonic_lengths[i];
+        if (end > max_data) max_data = end;
+    }
+    if (max_data <= 0) max_data = 1;
+
+    if (ensure_batch_buffers(device_id, max_data, count) != 0) return -1;
+    BatchState *state = &g_batch[device_id];
+
+    if (cudaMemcpy(state->d_data, mnemonic_data, (size_t)max_data, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(state->d_off, mnemonic_offsets, (size_t)count * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(state->d_len, mnemonic_lengths, (size_t)count * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+
+    int block_size = PBKDF2_BLOCK_SIZE;
+    int num_blocks = (count + block_size - 1) / block_size;
+
+    cudaEvent_t start, stop;
+    if (cudaEventCreate(&start) != cudaSuccess) return -1;
+    if (cudaEventCreate(&stop) != cudaSuccess) {
+        cudaEventDestroy(start);
+        return -1;
+    }
+
+    if (cudaEventRecord(start) != cudaSuccess) goto fail;
+    for (int i = 0; i < rounds; i++) {
+        pbkdf2_batch_kernel<<<num_blocks, block_size>>>(
+            state->d_data, state->d_off, state->d_len, count, state->d_seed);
+    }
+    if (cudaEventRecord(stop) != cudaSuccess) goto fail;
+    if (cudaEventSynchronize(stop) != cudaSuccess) goto fail;
+    if (cudaGetLastError() != cudaSuccess) goto fail;
+
+    if (kernel_ms_out) {
+        if (cudaEventElapsedTime(kernel_ms_out, start, stop) != cudaSuccess) goto fail;
+    }
+    if (sample_out) {
+        if (cudaMemcpy(sample_out, state->d_seed, sizeof(uint64_t), cudaMemcpyDeviceToHost) != cudaSuccess) goto fail;
+    }
+
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    return 0;
+
+fail:
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    return -1;
 }

@@ -30,5 +30,10 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte { return nil }
 // ComputePBKDF2Seeds 未实现，返回nil
 func (g *GPUComputer) ComputePBKDF2Seeds(mnemonics []string) []byte { return nil }
 
+// BenchmarkPBKDF2Kernel 未实现，返回失败
+func (g *GPUComputer) BenchmarkPBKDF2Kernel(mnemonics []string, rounds int) (float64, uint64, bool) {
+	return 0, 0, false
+}
+
 // Close 无操作
 func (g *GPUComputer) Close() error { return nil }

@@ -160,6 +160,34 @@ func (g *GPUComputer) ComputePBKDF2Seeds(mnemonics []string) []byte {
 	return seedBuf
 }
 
+// BenchmarkPBKDF2Kernel measures only the GPU PBKDF2 kernel time on a
+// pre-uploaded mnemonic batch. The timed region excludes Go-side flattening and
+// host/device copies after the initial upload.
+func (g *GPUComputer) BenchmarkPBKDF2Kernel(mnemonics []string, rounds int) (kernelMs float64, sample uint64, ok bool) {
+	if len(mnemonics) == 0 || rounds <= 0 {
+		return 0, 0, false
+	}
+	count := len(mnemonics)
+	flat, offsets, lengths := g.flattenMnemonics(mnemonics)
+
+	var ms C.float
+	var sampleC C.uint64_t
+	ret := C.gpu_benchmark_pbkdf2_kernel(
+		C.int(g.deviceID),
+		(*C.uint8_t)(unsafe.Pointer(&flat[0])),
+		(*C.int)(unsafe.Pointer(&offsets[0])),
+		(*C.int)(unsafe.Pointer(&lengths[0])),
+		C.int(count),
+		C.int(rounds),
+		&ms,
+		&sampleC,
+	)
+	if int(ret) < 0 {
+		return 0, 0, false
+	}
+	return float64(ms), uint64(sampleC), true
+}
+
 // EnumerateCompute performs BIP39 enumeration and TRON address derivation entirely on the GPU.
 // knownWordIndices: 12 entries where -1 means unknown position (word index 0-2047 otherwise).
 // unknownPositions: position indices in enumeration order (same order as index decomposition).

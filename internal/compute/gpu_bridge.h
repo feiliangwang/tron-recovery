@@ -49,6 +49,29 @@ int gpu_compute_pbkdf2_seeds(
 );
 
 /*
+ * Benchmark only the PBKDF2 CUDA kernel on pre-uploaded inputs.
+ *
+ * The timed region excludes host-side flattening and host/device copies after
+ * the initial input upload. The kernel is launched `rounds` times against the
+ * same input set and reports total kernel time in milliseconds.
+ *
+ * sample_out receives the first 8 bytes of the output buffer as a simple
+ * stability check.
+ *
+ * Returns 0 on success, -1 on CUDA error.
+ */
+int gpu_benchmark_pbkdf2_kernel(
+    int            device_id,
+    const uint8_t *mnemonic_data,
+    const int     *mnemonic_offsets,
+    const int     *mnemonic_lengths,
+    int            count,
+    int            rounds,
+    float         *kernel_ms_out,
+    uint64_t      *sample_out
+);
+
+/*
  * Enumerate index range on the specified GPU device:
  * BIP39 validation + full TRON address derivation.
  *
