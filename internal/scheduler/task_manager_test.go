@@ -235,17 +235,26 @@ func TestCompleteJob(t *testing.T) {
 	}
 }
 
-func TestIncrementCompleted(t *testing.T) {
+func TestSetCompleted(t *testing.T) {
 	tm := newTestManager(t)
 	job := tm.CreateJob("test", "mnemonic", 100)
 
-	tm.IncrementCompleted(job.ID, 5)
-	tm.IncrementCompleted(job.ID, 3)
+	tm.SetCompleted(job.ID, 5000)
 
 	got := tm.GetJob(job.ID)
-	if got.Completed != 2 {
-		t.Errorf("Completed = %d, want 2", got.Completed)
+	if got.Completed != 5000 {
+		t.Errorf("Completed = %d, want 5000", got.Completed)
 	}
+}
+
+func TestIncrementMatches(t *testing.T) {
+	tm := newTestManager(t)
+	job := tm.CreateJob("test", "mnemonic", 100)
+
+	tm.IncrementMatches(job.ID, 5)
+	tm.IncrementMatches(job.ID, 3)
+
+	got := tm.GetJob(job.ID)
 	if got.Matches != 8 {
 		t.Errorf("Matches = %d, want 8", got.Matches)
 	}
@@ -275,11 +284,17 @@ func TestStatePersistence(t *testing.T) {
 	tm1.StartJob(j1.ID)
 	tm1.SetTotal(j1.ID, 999)
 
+	// Close first manager before creating second
+	if err := tm1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
 	// Create a new manager from the same directory
 	tm2, err := NewTaskManager(dir)
 	if err != nil {
 		t.Fatalf("NewTaskManager reload failed: %v", err)
 	}
+	defer tm2.Close()
 
 	jobs := tm2.ListJobs()
 	if len(jobs) != 1 {
@@ -301,13 +316,26 @@ func TestStatePersistence(t *testing.T) {
 func TestAutoIDRestoredOnReload(t *testing.T) {
 	dir := t.TempDir()
 
-	tm1, _ := NewTaskManager(dir)
+	tm1, err := NewTaskManager(dir)
+	if err != nil {
+		t.Fatalf("NewTaskManager failed: %v", err)
+	}
 	j1 := tm1.CreateJob("job1", "m1", 100)
 	j2 := tm1.CreateJob("job2", "m2", 100)
 	_ = j2
 
+	// Close first manager
+	if err := tm1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
 	// New manager should continue IDs from where tm1 left off
-	tm2, _ := NewTaskManager(dir)
+	tm2, err := NewTaskManager(dir)
+	if err != nil {
+		t.Fatalf("NewTaskManager reload failed: %v", err)
+	}
+	defer tm2.Close()
+
 	j3 := tm2.CreateJob("job3", "m3", 100)
 
 	if j3.ID == j1.ID {

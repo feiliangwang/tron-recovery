@@ -17,19 +17,20 @@ import (
 	"sync"
 	"time"
 
+	"boon/internal/account"
 	"boon/internal/bip44"
 	"boon/internal/mnemonic"
 	"boon/internal/protocol"
 	"boon/internal/scheduler"
-	"boon/internal/tron"
 )
 
 //go:embed static
 var staticFS embed.FS
 
 var (
-	dataDir = flag.String("data", "./data", "数据目录")
-	port    = flag.Int("port", 8080, "HTTP服务端口")
+	dataDir   = flag.String("data", "./data", "数据目录")
+	port      = flag.Int("port", 8080, "HTTP服务端口")
+	accountDb = flag.String("accountdb", "", "账户数据库路径（LevelDB）")
 )
 
 // pendingTaskRecord 记录已分发但尚未提交结果的任务
@@ -65,7 +66,7 @@ type Server struct {
 	workersMu         sync.RWMutex
 	activeWorkerCount int // 当前在线 worker 数，变化时重置 job 速度窗口
 
-	tronClient *tron.Client // TRON HTTP API 客户端，用于确认账户状态
+	accountDb *account.Db // 账户数据库，用于检查地址是否存在
 }
 
 // CompactJobRunner 紧凑任务运行器
@@ -85,6 +86,15 @@ type CompactJobRunner struct {
 
 	// 1分钟滑动窗口速度（jobsMu 保护）
 	speedWindow []jobSpeedEntry
+
+	// 超时缺口队列：记录需要重新分配的索引区间（按 StartIdx 排序）
+	gaps []indexRange
+}
+
+// indexRange 索引区间
+type indexRange struct {
+	start int64
+	end   int64
 }
 
 // JobView 任务的完整视图（含实时计算字段）
@@ -103,6 +113,10 @@ type JobView struct {
 	ElapsedSeconds int64 `json:"elapsed_seconds"` // 自首次启动起累计壁钟秒数
 	Speed          int64 `json:"speed"`           // 当前阶段枚举速度（本次激活以来）
 	ETASeconds     int64 `json:"eta_seconds"`     // 预计剩余秒数，-1=无法估算
+
+	// 缺口信息
+	GapCount   int64 `json:"gap_count"`   // 缺口数量
+	GapIndices int64 `json:"gap_indices"` // 缺口总索引数
 }
 
 // WorkerInfo Worker信息
@@ -120,6 +134,8 @@ const (
 	minBatchSize = 1000
 	// maxBatchSize 最大批次大小（防止单次分配过多）
 	maxBatchSize = 2_000_000
+	// pendingTaskTimeout 飞行中任务超时时间（超过此时间未提交则回滚重分配）
+	pendingTaskTimeout = 5 * time.Minute
 )
 
 // Match 匹配结果
@@ -129,9 +145,7 @@ type Match struct {
 	Address    string    `json:"address"`      // TRON Base58Check 地址
 	RawAddrHex string    `json:"raw_addr_hex"` // 20字节地址的 hex 编码，用于重启后恢复查询能力
 	Time       time.Time `json:"time"`
-	Confirmed  *bool     `json:"confirmed"`   // nil=待确认, true=已激活, false=未激活
-	CreateTime int64     `json:"create_time"` // 账户创建时间（毫秒时间戳）
-	ConfirmErr bool      `json:"confirm_err"` // true=HTTP查询失败，非账户未激活
+	Exists     bool      `json:"exists"` // 账户是否存在于数据库中
 	rawAddr    []byte    // 运行时原始20字节地址（从 RawAddrHex 恢复）
 }
 
@@ -153,12 +167,16 @@ func main() {
 		workers:      make(map[string]*WorkerInfo),
 	}
 
-	// 初始化 TRON HTTP API 客户端
-	if tc, err := tron.NewClient(tron.DefaultEndpoint); err != nil {
-		log.Printf("TRON HTTP 客户端初始化失败（确认功能不可用）: %v", err)
+	// 初始化账户数据库
+	if *accountDb != "" {
+		adb, err := account.NewAccountDb(*accountDb)
+		if err != nil {
+			log.Fatalf("账户数据库初始化失败: %v", err)
+		}
+		server.accountDb = adb
+		log.Printf("账户数据库已就绪: %s (共 %d 条记录)", *accountDb, adb.Count())
 	} else {
-		server.tronClient = tc
-		log.Printf("TRON HTTP 客户端已就绪: %s", tron.DefaultEndpoint)
+		log.Printf("未指定 -accountdb 参数，匹配结果将无法确认账户是否存在")
 	}
 
 	// 恢复任务
@@ -169,9 +187,6 @@ func main() {
 
 	// Worker清理
 	go server.cleanWorkers()
-
-	// 后台重试确认失败的 match
-	go server.retryFailedConfirms()
 
 	// 路由
 	http.HandleFunc("/", server.handleIndex)
@@ -213,16 +228,24 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 			totalIdx     int64
 			running      bool
 			speedWindow  []jobSpeedEntry
+			gapCount     int
+			gapIndices   int64
 		}
 		snaps := make(map[string]runnerSnap, len(s.jobs))
 		for id, r := range s.jobs {
 			win := make([]jobSpeedEntry, len(r.speedWindow))
 			copy(win, r.speedWindow)
+			var gapIndices int64
+			for _, g := range r.gaps {
+				gapIndices += g.end - g.start
+			}
 			snaps[id] = runnerSnap{
 				completedIdx: r.CompletedIdx,
 				totalIdx:     r.TotalIdx,
 				running:      r.Running,
 				speedWindow:  win,
+				gapCount:     len(r.gaps),
+				gapIndices:   gapIndices,
 			}
 		}
 		s.jobsMu.RUnlock()
@@ -270,6 +293,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 				}
+
+				// 缺口信息
+				v.GapCount = int64(snap.gapCount)
+				v.GapIndices = snap.gapIndices
 			} else if job.StartedAt != nil {
 				// 任务已完成或暂停，runner 已移除
 				v.ElapsedSeconds = int64(now.Sub(*job.StartedAt).Seconds())
@@ -513,16 +540,34 @@ func (s *Server) handleTaskFetch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		start := runner.CurrentIdx
-		if start >= runner.TotalIdx {
-			continue
-		}
+		var start, end int64
 
-		end := start + batchSize
-		if end > runner.TotalIdx {
-			end = runner.TotalIdx
+		// 优先从缺口队列分配
+		if len(runner.gaps) > 0 {
+			gap := runner.gaps[0]
+			start = gap.start
+			end = gap.end
+			if end-start > batchSize {
+				// 缺口太大，只分配一部分
+				end = start + batchSize
+				runner.gaps[0].start = end
+			} else {
+				// 缺口全部分配，移除
+				runner.gaps = runner.gaps[1:]
+			}
+		} else {
+			// 无缺口，从 CurrentIdx 分配
+			start = runner.CurrentIdx
+			if start >= runner.TotalIdx {
+				continue
+			}
+
+			end = start + batchSize
+			if end > runner.TotalIdx {
+				end = runner.TotalIdx
+			}
+			runner.CurrentIdx = end
 		}
-		runner.CurrentIdx = end
 
 		task := &protocol.CompactTask{
 			TaskID:   time.Now().UnixNano(),
@@ -531,16 +576,31 @@ func (s *Server) handleTaskFetch(w http.ResponseWriter, r *http.Request) {
 			EndIdx:   end,
 		}
 
-		// 记录待确认任务（含区间信息，用于计算连续完成前沿）
+		// 记录待确认任务（内存 + 持久化）
+		now := time.Now()
 		s.pendingTasksMu.Lock()
-		s.pendingTasks[task.TaskID] = pendingTaskRecord{jobID: jobID, startIdx: start, endIdx: end, fetchedAt: time.Now()}
+		s.pendingTasks[task.TaskID] = pendingTaskRecord{jobID: jobID, startIdx: start, endIdx: end, fetchedAt: now}
 		s.pendingTasksMu.Unlock()
+
+		// 持久化 pending task
+		s.taskManager.AddPendingTask(scheduler.PendingTask{
+			JobID:     jobID,
+			StartIdx:  start,
+			EndIdx:    end,
+			TaskID:    task.TaskID,
+			FetchedAt: now.Unix(),
+		})
 
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(task.Encode())
 
-		log.Printf("[Task] %s <- job=%s range=[%d,%d) batch=%d speed=%d/s",
-			workerID, jobID, start, end, end-start, speed)
+		if len(runner.gaps) > 0 || start < runner.CurrentIdx {
+			log.Printf("[Task] %s <- job=%s range=[%d,%d) (缺口填充) gap剩余=%d",
+				workerID, jobID, start, end, len(runner.gaps))
+		} else {
+			log.Printf("[Task] %s <- job=%s range=[%d,%d) batch=%d speed=%d/s",
+				workerID, jobID, start, end, end-start, speed)
+		}
 		return
 	}
 
@@ -590,6 +650,8 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	rec, found := s.pendingTasks[result.TaskID]
 	if found {
 		delete(s.pendingTasks, result.TaskID)
+		// 删除持久化的 pending task
+		s.taskManager.CompletePendingTask(result.TaskID)
 	}
 	// 计算此 job 的连续完成前沿：飞行中任务的最小 StartIdx
 	// 若无飞行中任务，则安全点 = CurrentIdx
@@ -619,13 +681,18 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 					i++
 				}
 				runner.speedWindow = append(runner.speedWindow[i:], jobSpeedEntry{t: now, indices: indices, duration: taskDur})
-				// 安全重启点：若本 job 还有飞行中任务，取最小 StartIdx；否则取 CurrentIdx
+				// 更新安全重启点（用于 UI 显示）
 				if minPending, ok := committedByJob[jobID]; ok {
 					runner.CommittedIdx = minPending
 				} else {
 					runner.CommittedIdx = runner.CurrentIdx
 				}
-				s.taskManager.SetCompleted(jobID, runner.CommittedIdx)
+				// 持久化 CurrentIdx（而非 CommittedIdx），确保重启后不丢失已分发但未提交的任务
+				// 代价是可能有少量重复计算，但不会丢失任务
+				s.taskManager.SetCompleted(jobID, runner.CurrentIdx)
+
+				// 清理重叠的缺口（任务已完成，即使是从缺口分配的也无需再填补）
+				runner.gaps = removeOverlappingGaps(runner.gaps, rec.startIdx, rec.endIdx)
 
 				// 检查是否全部完成
 				if runner.CommittedIdx >= runner.TotalIdx {
@@ -812,10 +879,17 @@ func (s *Server) restoreJobs() {
 			UnknownPos: unknownPos,
 		}
 
+		// 从持久化加载该 job 的 pending tasks 作为缺口
+		pendingTasks := s.taskManager.GetPendingTasksByJob(job.ID)
+		gaps := make([]indexRange, 0, len(pendingTasks))
+		for _, pt := range pendingTasks {
+			gaps = append(gaps, indexRange{start: pt.StartIdx, end: pt.EndIdx})
+		}
+
 		runner := &CompactJobRunner{
 			Job:               job,
 			Template:          template,
-			CurrentIdx:        job.Completed, // 从安全前沿重新分发
+			CurrentIdx:        job.Completed, // 从已分发位置继续
 			CompletedIdx:      0,
 			CommittedIdx:      job.Completed,
 			TotalIdx:          total,
@@ -824,6 +898,7 @@ func (s *Server) restoreJobs() {
 			Running:           false, // 暂停状态，等待用户恢复
 			ActiveSince:       time.Time{},
 			CompletedAtActive: 0,
+			gaps:              gaps,
 		}
 
 		s.jobsMu.Lock()
@@ -834,20 +909,27 @@ func (s *Server) restoreJobs() {
 	}
 }
 
-// cleanWorkers 清理Worker，并在在线数量变化时重置 job 速度窗口
+// cleanWorkers 清理Worker，处理超时任务，并在在线数量变化时重置 job 速度窗口
 func (s *Server) cleanWorkers() {
 	ticker := time.NewTicker(10 * time.Second)
 	for range ticker.C {
-		cutoff := time.Now().Add(-60 * time.Second)
+		now := time.Now()
+		workerCutoff := now.Add(-60 * time.Second)
+
+		// 清理超时 Worker
 		s.workersMu.Lock()
 		for id, w := range s.workers {
-			if w.LastSeen.Before(cutoff) {
+			if w.LastSeen.Before(workerCutoff) {
 				delete(s.workers, id)
 			}
 		}
 		newCount := len(s.workers)
 		s.workersMu.Unlock()
 
+		// 处理超时的飞行中任务（加入缺口队列）
+		s.addTimedOutTasksToGaps(now)
+
+		// 更新 worker 计数并重置速度窗口
 		s.jobsMu.Lock()
 		if newCount != s.activeWorkerCount {
 			log.Printf("[Scheduler] 在线 Worker 数变化: %d → %d，重置速度窗口", s.activeWorkerCount, newCount)
@@ -856,6 +938,92 @@ func (s *Server) cleanWorkers() {
 		}
 		s.jobsMu.Unlock()
 	}
+}
+
+// addTimedOutTasksToGaps 将超时的飞行中任务加入缺口队列，优先重新分配
+func (s *Server) addTimedOutTasksToGaps(now time.Time) {
+	taskCutoff := now.Add(-pendingTaskTimeout)
+
+	s.pendingTasksMu.Lock()
+	defer s.pendingTasksMu.Unlock()
+
+	if len(s.pendingTasks) == 0 {
+		return
+	}
+
+	// 收集超时任务，按 jobID 分组
+	timedOut := make(map[string][]pendingTaskRecord) // jobID -> []task
+	var timedOutTaskIDs []int64
+	for taskID, rec := range s.pendingTasks {
+		if rec.fetchedAt.Before(taskCutoff) {
+			timedOut[rec.jobID] = append(timedOut[rec.jobID], rec)
+			timedOutTaskIDs = append(timedOutTaskIDs, taskID)
+			delete(s.pendingTasks, taskID)
+		}
+	}
+
+	if len(timedOut) == 0 {
+		return
+	}
+
+	// 删除持久化的超时任务
+	for _, taskID := range timedOutTaskIDs {
+		s.taskManager.CompletePendingTask(taskID)
+	}
+
+	// 将超时任务加入对应 job 的缺口队列
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+
+	for jobID, tasks := range timedOut {
+		runner, ok := s.jobs[jobID]
+		if !ok || !runner.Running {
+			continue
+		}
+
+		var totalIndices int64
+		for _, t := range tasks {
+			runner.gaps = append(runner.gaps, indexRange{start: t.startIdx, end: t.endIdx})
+			totalIndices += t.endIdx - t.startIdx
+		}
+
+		// 按 start 排序缺口，便于顺序分配
+		sortGaps(runner.gaps)
+
+		log.Printf("[Scheduler] 任务超时加入缺口: job=%s 缺口数=%d 索引数=%d",
+			jobID, len(runner.gaps), totalIndices)
+	}
+}
+
+// sortGaps 按起始位置排序缺口
+func sortGaps(gaps []indexRange) {
+	for i := 0; i < len(gaps)-1; i++ {
+		for j := i + 1; j < len(gaps); j++ {
+			if gaps[j].start < gaps[i].start {
+				gaps[i], gaps[j] = gaps[j], gaps[i]
+			}
+		}
+	}
+}
+
+// removeOverlappingGaps 移除与指定区间重叠的缺口
+func removeOverlappingGaps(gaps []indexRange, start, end int64) []indexRange {
+	var result []indexRange
+	for _, g := range gaps {
+		if g.end <= start || g.start >= end {
+			// 无重叠
+			result = append(result, g)
+		} else {
+			// 有重叠，可能需要分割
+			if g.start < start {
+				result = append(result, indexRange{start: g.start, end: start})
+			}
+			if g.end > end {
+				result = append(result, indexRange{start: end, end: g.end})
+			}
+		}
+	}
+	return result
 }
 
 // resetJobSpeedWindowsLocked 清空所有 job 的速度窗口（调用前须持有 jobsMu 写锁）
@@ -899,7 +1067,7 @@ func (s *Server) loadMatches() {
 		return
 	}
 
-	// 从 RawAddrHex 恢复 rawAddr，对仍需重试的重新标记 ConfirmErr
+	// 从 RawAddrHex 恢复 rawAddr
 	for _, m := range matches {
 		if m.RawAddrHex != "" {
 			if b, err := hex.DecodeString(m.RawAddrHex); err == nil {
@@ -922,113 +1090,22 @@ func extractJobNum(jobID string) int64 {
 	return num
 }
 
-// confirmMatch 后台调用 TRON HTTP API 确认账户是否已激活（单次尝试，失败后由 retryFailedConfirms 重试）
+// confirmMatch 检查账户是否存在于本地数据库中
 func (s *Server) confirmMatch(m *Match) {
-	if s.tronClient == nil {
-		s.matchesMu.Lock()
-		m.ConfirmErr = true
-		s.matchesMu.Unlock()
+	if s.accountDb == nil {
 		return
 	}
 
-	activated, createTime, err := s.tronClient.IsActivated(m.rawAddr)
-	if err != nil {
-		log.Printf("[Confirm] HTTP 查询失败 %s: %v", m.Address, err)
-		s.matchesMu.Lock()
-		m.ConfirmErr = true
-		s.matchesMu.Unlock()
-		return
-	}
+	exists := s.accountDb.IsExist(m.rawAddr)
 
 	s.matchesMu.Lock()
-	m.Confirmed = &activated
-	m.CreateTime = createTime
-	m.ConfirmErr = false
+	m.Exists = exists
 	s.saveMatchesLocked()
 	s.matchesMu.Unlock()
 
-	if activated {
-		log.Printf("[Confirm] ✅ 账户已激活 %s create_time=%d", m.Address, createTime)
+	if exists {
+		log.Printf("[Confirm] ✅ 账户存在 %s", m.Address)
 	} else {
-		log.Printf("[Confirm] ❌ 账户未激活 %s", m.Address)
-	}
-}
-
-// retryFailedConfirms 定时重试所有确认失败的 match，指数退避，直到成功为止
-func (s *Server) retryFailedConfirms() {
-	// 退避间隔序列：30s, 1m, 2m, 5m, 10m，之后固定 10m 轮询
-	backoff := []time.Duration{
-		30 * time.Second,
-		1 * time.Minute,
-		2 * time.Minute,
-		5 * time.Minute,
-		10 * time.Minute,
-	}
-
-	type retryState struct {
-		attempt int
-		nextAt  time.Time
-	}
-	states := make(map[*Match]*retryState)
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		if s.tronClient == nil {
-			continue
-		}
-
-		now := time.Now()
-
-		s.matchesMu.Lock()
-		var toRetry []*Match
-		for _, m := range s.matches {
-			if !m.ConfirmErr {
-				continue
-			}
-			st, ok := states[m]
-			if !ok {
-				st = &retryState{attempt: 0, nextAt: now}
-				states[m] = st
-			}
-			if now.Before(st.nextAt) {
-				continue
-			}
-			toRetry = append(toRetry, m)
-		}
-		s.matchesMu.Unlock()
-
-		for _, m := range toRetry {
-			st := states[m]
-			log.Printf("[Confirm] 重试确认（第 %d 次）: %s", st.attempt+1, m.Address)
-
-			activated, createTime, err := s.tronClient.IsActivated(m.rawAddr)
-			if err != nil {
-				log.Printf("[Confirm] 重试失败（第 %d 次）%s: %v", st.attempt+1, m.Address, err)
-				st.attempt++
-				idx := st.attempt
-				if idx >= len(backoff) {
-					idx = len(backoff) - 1
-				}
-				st.nextAt = now.Add(backoff[idx])
-				continue
-			}
-
-			s.matchesMu.Lock()
-			m.Confirmed = &activated
-			m.CreateTime = createTime
-			m.ConfirmErr = false
-			s.saveMatchesLocked()
-			s.matchesMu.Unlock()
-
-			delete(states, m)
-
-			if activated {
-				log.Printf("[Confirm] ✅ 重试成功，账户已激活 %s create_time=%d", m.Address, createTime)
-			} else {
-				log.Printf("[Confirm] ❌ 重试成功，账户未激活 %s", m.Address)
-			}
-		}
+		log.Printf("[Confirm] ❌ 账户不存在 %s", m.Address)
 	}
 }

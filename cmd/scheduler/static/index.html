@@ -477,6 +477,7 @@
                                 <span>运行时长: <span class="stat-value">${elapsed}</span></span>
                                 <span>预计完成: <span class="stat-value">${eta}</span></span>
                                 <span>匹配: <span class="stat-value">${job.matches || 0}</span></span>
+                                <span style="${job.gap_count > 0 ? 'color:#f87171' : ''}">缺口: <span class="stat-value">${job.gap_count || 0}</span> (${formatNum(job.gap_indices || 0)} 索引)</span>
                             </div>
                             <div class="job-actions">${actions}</div>
                         </div>

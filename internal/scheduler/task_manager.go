@@ -1,62 +1,109 @@
 package scheduler
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 // Job 任务作业
 type Job struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Mnemonic    string    `json:"mnemonic"`
-	BatchSize   int       `json:"batch_size"`
-	Status      string    `json:"status"` // pending, running, paused, completed
-	Total       int64     `json:"total"`
-	Completed   int64     `json:"completed"`
-	Matches     int64     `json:"matches"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Mnemonic    string     `json:"mnemonic"`
+	BatchSize   int        `json:"batch_size"`
+	Status      string     `json:"status"` // pending, running, paused, completed
+	Total       int64      `json:"total"`
+	Completed   int64      `json:"completed"`
+	Matches     int64      `json:"matches"`
+	CreatedAt   time.Time  `json:"created_at"`
 	StartedAt   *time.Time `json:"started_at"`
 	CompletedAt *time.Time `json:"completed_at"`
 }
 
-// State 持久化状态
-type State struct {
-	Jobs      map[string]*Job `json:"jobs"`
-	UpdatedAt time.Time       `json:"updated_at"`
+// PendingTask 飞行中任务记录
+type PendingTask struct {
+	JobID     string `json:"job_id"`
+	StartIdx  int64  `json:"start_idx"`
+	EndIdx    int64  `json:"end_idx"`
+	TaskID    int64  `json:"task_id"`
+	FetchedAt int64  `json:"fetched_at"` // Unix timestamp
 }
 
 // TaskManager 任务管理器
 type TaskManager struct {
+	db     *leveldb.DB
 	jobs   map[string]*Job
 	mu     sync.RWMutex
-	file   string
 	autoID int
 }
 
+// Key prefixes
+var (
+	keyPrefixJob     = []byte("job:")
+	keyPrefixPending = []byte("pending:") // pending:{taskID}
+	keyMetaAutoID    = []byte("meta:autoID")
+)
+
 // NewTaskManager 创建任务管理器
 func NewTaskManager(dataDir string) (*TaskManager, error) {
+	dbPath := filepath.Join(dataDir, "scheduler.db")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, err
 	}
 
-	tm := &TaskManager{
-		jobs: make(map[string]*Job),
-		file: filepath.Join(dataDir, "state.json"),
+	db, err := leveldb.OpenFile(dbPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open leveldb: %w", err)
 	}
 
-	// 尝试恢复状态
-	if err := tm.load(); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("failed to load state: %w", err)
-		}
+	tm := &TaskManager{
+		db:   db,
+		jobs: make(map[string]*Job),
 	}
+
+	// 恢复 autoID
+	if data, err := db.Get(keyMetaAutoID, nil); err == nil {
+		tm.autoID = int(binary.BigEndian.Uint64(data))
+	}
+
+	// 加载所有 jobs
+	tm.loadJobs()
 
 	return tm, nil
+}
+
+// loadJobs 加载所有任务
+func (tm *TaskManager) loadJobs() {
+	iter := tm.db.NewIterator(util.BytesPrefix(keyPrefixJob), nil)
+	defer iter.Release()
+
+	for iter.Next() {
+		var job Job
+		if err := json.Unmarshal(iter.Value(), &job); err != nil {
+			continue
+		}
+		tm.jobs[job.ID] = &job
+
+		// 恢复 autoID
+		var num int
+		if _, err := fmt.Sscanf(job.ID, "job-%d", &num); err == nil && num > tm.autoID {
+			tm.autoID = num
+		}
+	}
+}
+
+// Close 关闭数据库
+func (tm *TaskManager) Close() error {
+	return tm.db.Close()
 }
 
 // CreateJob 创建任务
@@ -77,7 +124,8 @@ func (tm *TaskManager) CreateJob(name, mnemonic string, batchSize int) *Job {
 	}
 
 	tm.jobs[id] = job
-	tm.save()
+	tm.saveJob(job)
+	tm.saveAutoID()
 
 	return job
 }
@@ -106,9 +154,9 @@ func (tm *TaskManager) UpdateJob(job *Job) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if j, exists := tm.jobs[job.ID]; exists {
-		*j = *job
-		tm.save()
+	if _, exists := tm.jobs[job.ID]; exists {
+		tm.jobs[job.ID] = job
+		tm.saveJob(job)
 	}
 }
 
@@ -125,7 +173,7 @@ func (tm *TaskManager) StartJob(id string) bool {
 	now := time.Now()
 	job.Status = "running"
 	job.StartedAt = &now
-	tm.save()
+	tm.saveJob(job)
 	return true
 }
 
@@ -140,7 +188,7 @@ func (tm *TaskManager) PauseJob(id string) bool {
 	}
 
 	job.Status = "paused"
-	tm.save()
+	tm.saveJob(job)
 	return true
 }
 
@@ -155,7 +203,7 @@ func (tm *TaskManager) ResumeJob(id string) bool {
 	}
 
 	job.Status = "running"
-	tm.save()
+	tm.saveJob(job)
 	return true
 }
 
@@ -169,7 +217,14 @@ func (tm *TaskManager) DeleteJob(id string) bool {
 	}
 
 	delete(tm.jobs, id)
-	tm.save()
+
+	// 删除 job 数据
+	if err := tm.db.Delete(tm.jobKey(id), nil); err != nil {
+		log.Printf("[TaskManager] 删除 job 失败: %v", err)
+	}
+	// 删除该 job 的所有 pending tasks
+	tm.deletePendingTasksByJob(id)
+
 	return true
 }
 
@@ -182,19 +237,9 @@ func (tm *TaskManager) CompleteJob(id string) {
 		now := time.Now()
 		job.Status = "completed"
 		job.CompletedAt = &now
-		tm.save()
-	}
-}
-
-// IncrementCompleted 增加完成计数
-func (tm *TaskManager) IncrementCompleted(id string, matches int) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	if job, exists := tm.jobs[id]; exists {
-		job.Completed++
-		job.Matches += int64(matches)
-		tm.save()
+		tm.saveJob(job)
+		// 删除该 job 的所有 pending tasks
+		tm.deletePendingTasksByJob(id)
 	}
 }
 
@@ -205,7 +250,7 @@ func (tm *TaskManager) SetTotal(id string, total int64) {
 
 	if job, exists := tm.jobs[id]; exists {
 		job.Total = total
-		tm.save()
+		tm.saveJob(job)
 	}
 }
 
@@ -216,46 +261,142 @@ func (tm *TaskManager) SetCompleted(id string, completed int64) {
 
 	if job, exists := tm.jobs[id]; exists {
 		job.Completed = completed
-		tm.save()
+		tm.saveJob(job)
 	}
 }
 
-// load 加载状态
-func (tm *TaskManager) load() error {
-	data, err := os.ReadFile(tm.file)
-	if err != nil {
-		return err
+// IncrementMatches 增加匹配计数
+func (tm *TaskManager) IncrementMatches(id string, count int) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if job, exists := tm.jobs[id]; exists {
+		job.Matches += int64(count)
+		tm.saveJob(job)
 	}
-
-	var state State
-	if err := json.Unmarshal(data, &state); err != nil {
-		return err
-	}
-
-	tm.jobs = state.Jobs
-
-	// 恢复 autoID
-	for id := range tm.jobs {
-		var num int
-		if _, err := fmt.Sscanf(id, "job-%d", &num); err == nil && num > tm.autoID {
-			tm.autoID = num
-		}
-	}
-
-	return nil
 }
 
-// save 保存状态
-func (tm *TaskManager) save() {
-	state := State{
-		Jobs:      tm.jobs,
-		UpdatedAt: time.Now(),
-	}
+// ============================================================
+// Pending Tasks 管理（飞行中任务持久化）
+// ============================================================
 
-	data, err := json.MarshalIndent(state, "", "  ")
+// AddPendingTask 添加飞行中任务（分发时调用）
+func (tm *TaskManager) AddPendingTask(pt PendingTask) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	data, err := json.Marshal(pt)
 	if err != nil {
+		log.Printf("[TaskManager] 序列化 pending task 失败: %v", err)
 		return
 	}
 
-	os.WriteFile(tm.file, data, 0644)
+	key := tm.pendingKey(pt.TaskID)
+	if err := tm.db.Put(key, data, nil); err != nil {
+		log.Printf("[TaskManager] 保存 pending task 失败: %v", err)
+	}
+}
+
+// CompletePendingTask 完成飞行中任务（提交时调用）
+func (tm *TaskManager) CompletePendingTask(taskID int64) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	key := tm.pendingKey(taskID)
+	if err := tm.db.Delete(key, nil); err != nil {
+		log.Printf("[TaskManager] 删除 pending task 失败: %v", err)
+	}
+}
+
+// LoadAllPendingTasks 加载所有飞行中任务（重启恢复时调用）
+func (tm *TaskManager) LoadAllPendingTasks() []PendingTask {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	return tm.loadAllPendingTasksLocked()
+}
+
+// loadAllPendingTasksLocked 内部方法，不加锁
+func (tm *TaskManager) loadAllPendingTasksLocked() []PendingTask {
+	var tasks []PendingTask
+	iter := tm.db.NewIterator(util.BytesPrefix(keyPrefixPending), nil)
+	defer iter.Release()
+
+	for iter.Next() {
+		var pt PendingTask
+		if err := json.Unmarshal(iter.Value(), &pt); err != nil {
+			continue
+		}
+		tasks = append(tasks, pt)
+	}
+	return tasks
+}
+
+// GetPendingTasksByJob 获取指定 job 的飞行中任务
+func (tm *TaskManager) GetPendingTasksByJob(jobID string) []PendingTask {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	all := tm.loadAllPendingTasksLocked()
+	var result []PendingTask
+	for _, pt := range all {
+		if pt.JobID == jobID {
+			result = append(result, pt)
+		}
+	}
+	return result
+}
+
+// deletePendingTasksByJob 删除指定 job 的所有 pending tasks（调用前须持有锁）
+func (tm *TaskManager) deletePendingTasksByJob(jobID string) {
+	iter := tm.db.NewIterator(util.BytesPrefix(keyPrefixPending), nil)
+	var keysToDelete [][]byte
+	for iter.Next() {
+		var pt PendingTask
+		if err := json.Unmarshal(iter.Value(), &pt); err != nil {
+			continue
+		}
+		if pt.JobID == jobID {
+			keysToDelete = append(keysToDelete, append([]byte{}, iter.Key()...))
+		}
+	}
+	iter.Release()
+
+	for _, key := range keysToDelete {
+		tm.db.Delete(key, nil)
+	}
+}
+
+// ============================================================
+// 内部方法
+// ============================================================
+
+func (tm *TaskManager) jobKey(id string) []byte {
+	return append([]byte("job:"), []byte(id)...)
+}
+
+func (tm *TaskManager) pendingKey(taskID int64) []byte {
+	key := make([]byte, 8+8)
+	copy(key[0:8], "pending:")
+	binary.BigEndian.PutUint64(key[8:16], uint64(taskID))
+	return key
+}
+
+func (tm *TaskManager) saveJob(job *Job) {
+	data, err := json.Marshal(job)
+	if err != nil {
+		log.Printf("[TaskManager] 序列化 job 失败: %v", err)
+		return
+	}
+	if err := tm.db.Put(tm.jobKey(job.ID), data, nil); err != nil {
+		log.Printf("[TaskManager] 保存 job 失败: %v", err)
+	}
+}
+
+func (tm *TaskManager) saveAutoID() {
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(tm.autoID))
+	if err := tm.db.Put(keyMetaAutoID, data, nil); err != nil {
+		log.Printf("[TaskManager] 保存 autoID 失败: %v", err)
+	}
 }
