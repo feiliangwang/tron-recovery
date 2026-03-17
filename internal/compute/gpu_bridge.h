@@ -33,6 +33,22 @@ int gpu_compute_addresses(
 );
 
 /*
+ * Compute PBKDF2-HMAC-SHA512(2048) seed material from mnemonics on the
+ * specified GPU device.
+ *
+ * Output layout is count contiguous 64-byte seeds.
+ * Returns 0 on success, -1 on CUDA error.
+ */
+int gpu_compute_pbkdf2_seeds(
+    int            device_id,
+    const uint8_t *mnemonic_data,
+    const int     *mnemonic_offsets,
+    const int     *mnemonic_lengths,
+    int            count,
+    uint8_t       *seeds_out
+);
+
+/*
  * Enumerate index range on the specified GPU device:
  * BIP39 validation + full TRON address derivation.
  *

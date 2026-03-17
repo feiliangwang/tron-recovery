@@ -27,5 +27,8 @@ func (g *GPUComputer) DeviceID() int { return 0 }
 // Compute 未实现，返回nil
 func (g *GPUComputer) Compute(mnemonics []string) [][]byte { return nil }
 
+// ComputePBKDF2Seeds 未实现，返回nil
+func (g *GPUComputer) ComputePBKDF2Seeds(mnemonics []string) []byte { return nil }
+
 // Close 无操作
 func (g *GPUComputer) Close() error { return nil }

@@ -68,14 +68,8 @@ func NewGPUComputerAll() ([]*GPUComputer, error) {
 // DeviceID 返回该计算器绑定的 GPU 设备 ID
 func (g *GPUComputer) DeviceID() int { return g.deviceID }
 
-// Compute 计算助记词对应的TRON地址（GPU版本）
-func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
-	if len(mnemonics) == 0 {
-		return nil
-	}
+func (g *GPUComputer) flattenMnemonics(mnemonics []string) (flat []byte, offsets []C.int, lengths []C.int) {
 	count := len(mnemonics)
-
-	// Flatten mnemonics into a single byte buffer with one allocation.
 	totalBytes := 0
 	for _, m := range mnemonics {
 		totalBytes += len(m)
@@ -85,19 +79,22 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
 	} else {
 		g.flatBuf = g.flatBuf[:totalBytes]
 	}
-	flat := g.flatBuf
+	flat = g.flatBuf
+
 	if cap(g.offsetBuf) < count {
 		g.offsetBuf = make([]C.int, count)
 	} else {
 		g.offsetBuf = g.offsetBuf[:count]
 	}
+	offsets = g.offsetBuf
+
 	if cap(g.lengthBuf) < count {
 		g.lengthBuf = make([]C.int, count)
 	} else {
 		g.lengthBuf = g.lengthBuf[:count]
 	}
-	offsets := g.offsetBuf
-	lengths := g.lengthBuf
+	lengths = g.lengthBuf
+
 	pos := 0
 	for i, m := range mnemonics {
 		offsets[i] = C.int(pos)
@@ -108,6 +105,16 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
 	if len(flat) == 0 {
 		flat = []byte{0}
 	}
+	return flat, offsets, lengths
+}
+
+// Compute 计算助记词对应的TRON地址（GPU版本）
+func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
+	if len(mnemonics) == 0 {
+		return nil
+	}
+	count := len(mnemonics)
+	flat, offsets, lengths := g.flattenMnemonics(mnemonics)
 
 	addrBuf := make([]byte, count*20)
 
@@ -127,6 +134,30 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
 	}
 
 	return addressViews(addrBuf, count)
+}
+
+// ComputePBKDF2Seeds computes PBKDF2-HMAC-SHA512(2048) seeds for the given
+// mnemonics on GPU and returns them as a contiguous count*64-byte buffer.
+func (g *GPUComputer) ComputePBKDF2Seeds(mnemonics []string) []byte {
+	if len(mnemonics) == 0 {
+		return nil
+	}
+	count := len(mnemonics)
+	flat, offsets, lengths := g.flattenMnemonics(mnemonics)
+	seedBuf := make([]byte, count*64)
+
+	ret := C.gpu_compute_pbkdf2_seeds(
+		C.int(g.deviceID),
+		(*C.uint8_t)(unsafe.Pointer(&flat[0])),
+		(*C.int)(unsafe.Pointer(&offsets[0])),
+		(*C.int)(unsafe.Pointer(&lengths[0])),
+		C.int(count),
+		(*C.uint8_t)(unsafe.Pointer(&seedBuf[0])),
+	)
+	if int(ret) < 0 {
+		return nil
+	}
+	return seedBuf
 }
 
 // EnumerateCompute performs BIP39 enumeration and TRON address derivation entirely on the GPU.
