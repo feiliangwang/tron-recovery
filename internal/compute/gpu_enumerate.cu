@@ -13,7 +13,6 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <string.h>
-#include "gpu_bridge.h"
 #include "bip39_wordlist.h"
 
 /* ================================================================
@@ -495,14 +494,17 @@ __device__ __noinline__ void en_bip32_child_norm(en_bip32key *out, const en_bip3
 }
 
 __device__ __noinline__ void en_bip44_tron(const uint8_t seed[64], uint8_t privkey[32]){
-    en_bip32key m,k1,k2,k3,k4,k5;
-    en_bip32_master(&m,seed);
-    en_bip32_child_hard(&k1,&m, 0x80000000u+44);
-    en_bip32_child_hard(&k2,&k1,0x80000000u+195);
-    en_bip32_child_hard(&k3,&k2,0x80000000u+0);
-    en_bip32_child_norm(&k4,&k3,0);
-    en_bip32_child_norm(&k5,&k4,0);
-    memcpy(privkey,k5.key,32);
+    /* Keep only the current and next BIP32 node live at once.
+     * This cuts per-thread local state substantially versus holding the
+     * full m/k1/k2/k3/k4/k5 chain simultaneously. */
+    en_bip32key cur, next;
+    en_bip32_master(&cur,seed);
+    en_bip32_child_hard(&next,&cur, 0x80000000u+44);  cur = next;
+    en_bip32_child_hard(&next,&cur,0x80000000u+195);  cur = next;
+    en_bip32_child_hard(&next,&cur,0x80000000u+0);    cur = next;
+    en_bip32_child_norm(&next,&cur,0);                cur = next;
+    en_bip32_child_norm(&next,&cur,0);
+    memcpy(privkey,next.key,32);
 }
 
 /* ================================================================
@@ -775,20 +777,17 @@ __global__ void tron_derive_kernel(
         for (int j = 0; j < 8 && w[j]; j++) mn[ml++] = w[j];
     }
 
-    /* Full TRON derivation pipeline */
-    uint8_t seed[64];
-    en_pbkdf2_hmac_sha512(mn, (uint32_t)ml, seed);
+    /* Full TRON derivation pipeline with re-used scratch:
+     * tmp[0..63]  : seed -> final private key (low 32 bytes) -> keccak hash
+     * mn[0..63]   : mnemonic bytes are no longer needed after PBKDF2, so
+     *               re-use the front of mn[] as the uncompressed pubkey. */
+    uint8_t tmp[64];
+    en_pbkdf2_hmac_sha512(mn, (uint32_t)ml, tmp);
+    en_bip44_tron(tmp, tmp);
+    en_priv_to_upub64(tmp, mn);
+    en_keccak256(mn, 64, tmp);
 
-    uint8_t priv[32];
-    en_bip44_tron(seed, priv);
-
-    uint8_t pub[64];
-    en_priv_to_upub64(priv, pub);
-
-    uint8_t khash[32];
-    en_keccak256(pub, 64, khash);
-
-    const uint8_t *addr = khash + 12;  /* 20-byte address */
+    const uint8_t *addr = tmp + 12;  /* 20-byte address */
 
     if (bloom_bits) {
         /* Bloom mode: only write addresses that pass the filter */
@@ -867,9 +866,7 @@ fail:
 /* ================================================================
  * Host functions
  * ================================================================ */
-extern "C" {
-
-int gpu_enumerate_compute(
+extern "C" int gpu_enumerate_compute(
     int            device_id,
     int64_t        start_idx,
     int64_t        end_idx,
@@ -966,7 +963,7 @@ err:
 }
 
 /* Upload bloom filter to GPU persistent memory for the specified device. */
-int gpu_bloom_upload(int device_id, const uint64_t *words, uint64_t word_count, uint64_t m, uint32_t k)
+extern "C" int gpu_bloom_upload(int device_id, const uint64_t *words, uint64_t word_count, uint64_t m, uint32_t k)
 {
     if (cudaSetDevice(device_id) != cudaSuccess) return -1;
     DeviceState *ds = &g_dev[device_id];
@@ -982,7 +979,7 @@ int gpu_bloom_upload(int device_id, const uint64_t *words, uint64_t word_count, 
 }
 
 /* Release GPU bloom filter memory for the specified device */
-void gpu_bloom_free(int device_id)
+extern "C" void gpu_bloom_free(int device_id)
 {
     if (cudaSetDevice(device_id) != cudaSuccess) return;
     DeviceState *ds = &g_dev[device_id];
@@ -999,7 +996,7 @@ __global__ void bloom_test_kernel(const uint8_t *addr, int *result,
 
 /* Test a 20-byte address against the bloom filter on the specified device.
  * Returns 1 if present, 0 if absent, -1 if no filter loaded. */
-int gpu_bloom_test_addr(int device_id, const uint8_t *addr20)
+extern "C" int gpu_bloom_test_addr(int device_id, const uint8_t *addr20)
 {
     if (cudaSetDevice(device_id) != cudaSuccess) return -1;
     DeviceState *ds = &g_dev[device_id];
@@ -1055,7 +1052,7 @@ __global__ void bip39_debug_kernel(const int16_t *wi_in, uint8_t *out_stored, ui
     /* (re-using out_sha as entropy[0] is enough; caller checks sha[0]>>4) */
 }
 
-int gpu_bip39_debug(int device_id, const int16_t wi[12], uint8_t *stored_cs_out, uint8_t *sha0_out)
+extern "C" int gpu_bip39_debug(int device_id, const int16_t wi[12], uint8_t *stored_cs_out, uint8_t *sha0_out)
 {
     if (cudaSetDevice(device_id) != cudaSuccess) return -1;
     int16_t *d_wi = NULL;
@@ -1075,7 +1072,7 @@ int gpu_bip39_debug(int device_id, const int16_t wi[12], uint8_t *stored_cs_out,
 }
 
 /* Release all persistent GPU buffers for the specified device (call on shutdown) */
-void gpu_enumerate_cleanup(int device_id)
+extern "C" void gpu_enumerate_cleanup(int device_id)
 {
     if (cudaSetDevice(device_id) != cudaSuccess) return;
     gpu_bloom_free(device_id);
@@ -1088,6 +1085,3 @@ void gpu_enumerate_cleanup(int device_id)
     if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
     ds->buf_capacity = 0;
 }
-
-
-} /* extern "C" */

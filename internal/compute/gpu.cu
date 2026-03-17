@@ -22,7 +22,6 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <string.h>
-#include "gpu_bridge.h"
 
 /* ================================================================
  * Byte-order helpers (SHA-512 and BIP32 use big-endian)
