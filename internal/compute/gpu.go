@@ -20,6 +20,10 @@ import (
 type GPUComputer struct {
 	deviceID   int
 	bloomOnGPU bool
+	flatBuf    []byte
+	offsetBuf  []C.int
+	lengthBuf  []C.int
+	unkBuf     []C.int8_t
 }
 
 func supportedGPUDeviceCount() int {
@@ -76,9 +80,24 @@ func (g *GPUComputer) Compute(mnemonics []string) [][]byte {
 	for _, m := range mnemonics {
 		totalBytes += len(m)
 	}
-	flat := make([]byte, totalBytes)
-	offsets := make([]C.int, count)
-	lengths := make([]C.int, count)
+	if cap(g.flatBuf) < totalBytes {
+		g.flatBuf = make([]byte, totalBytes)
+	} else {
+		g.flatBuf = g.flatBuf[:totalBytes]
+	}
+	flat := g.flatBuf
+	if cap(g.offsetBuf) < count {
+		g.offsetBuf = make([]C.int, count)
+	} else {
+		g.offsetBuf = g.offsetBuf[:count]
+	}
+	if cap(g.lengthBuf) < count {
+		g.lengthBuf = make([]C.int, count)
+	} else {
+		g.lengthBuf = g.lengthBuf[:count]
+	}
+	offsets := g.offsetBuf
+	lengths := g.lengthBuf
 	pos := 0
 	for i, m := range mnemonics {
 		offsets[i] = C.int(pos)
@@ -130,13 +149,22 @@ func (g *GPUComputer) EnumerateCompute(
 		capacity = 2048
 	}
 
-	knownC := make([]C.int16_t, 12)
+	var knownC [12]C.int16_t
 	for i, v := range knownWordIndices {
 		knownC[i] = C.int16_t(v)
 	}
-	unkC := make([]C.int8_t, len(unknownPositions))
+	if cap(g.unkBuf) < len(unknownPositions) {
+		g.unkBuf = make([]C.int8_t, len(unknownPositions))
+	} else {
+		g.unkBuf = g.unkBuf[:len(unknownPositions)]
+	}
+	unkC := g.unkBuf
 	for i, v := range unknownPositions {
 		unkC[i] = C.int8_t(v)
+	}
+	var unkPtr *C.int8_t
+	if len(unkC) > 0 {
+		unkPtr = (*C.int8_t)(unsafe.Pointer(&unkC[0]))
 	}
 
 	outAddrs := make([]byte, capacity*20)
@@ -148,7 +176,7 @@ func (g *GPUComputer) EnumerateCompute(
 		C.int64_t(startIdx),
 		C.int64_t(endIdx),
 		(*C.int16_t)(unsafe.Pointer(&knownC[0])),
-		(*C.int8_t)(unsafe.Pointer(&unkC[0])),
+		unkPtr,
 		C.int8_t(len(unknownPositions)),
 		(*C.uint8_t)(unsafe.Pointer(&outAddrs[0])),
 		(*C.int64_t)(unsafe.Pointer(&outIdxs[0])),
