@@ -174,9 +174,8 @@ func main() {
 			log.Fatalf("账户数据库初始化失败: %v", err)
 		}
 		server.accountDb = adb
-		log.Printf("账户数据库已就绪: %s (共 %d 条记录)", *accountDb, adb.Count())
 	} else {
-		log.Printf("未指定 -accountdb 参数，匹配结果将无法确认账户是否存在")
+		panic("未指定 -accountdb 参数，匹配结果将无法确认账户是否存在")
 	}
 
 	// 恢复任务
