@@ -39,7 +39,8 @@ func (db *Db) IteratorAccount(do func(addr20 []byte)) {
 }
 
 func (db *Db) IsExist(addr20 []byte) bool {
-	if _, err := db.db.Get(addr20, nil); err != nil {
+	addr := append([]byte{0x41}, addr20...)
+	if _, err := db.db.Get(addr, nil); err != nil {
 		return false
 	}
 	return true
