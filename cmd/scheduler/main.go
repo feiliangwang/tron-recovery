@@ -34,9 +34,9 @@ var (
 
 // pendingTaskRecord 记录已分发但尚未提交结果的任务
 type pendingTaskRecord struct {
-	jobID    string
-	startIdx int64
-	endIdx   int64
+	jobID     string
+	startIdx  int64
+	endIdx    int64
 	fetchedAt time.Time // 任务分发时间，用于计算实际计算耗时
 }
 
@@ -61,9 +61,9 @@ type Server struct {
 	matches   []*Match
 	matchesMu sync.Mutex
 
-	workers            map[string]*WorkerInfo
-	workersMu          sync.RWMutex
-	activeWorkerCount  int // 当前在线 worker 数，变化时重置 job 速度窗口
+	workers           map[string]*WorkerInfo
+	workersMu         sync.RWMutex
+	activeWorkerCount int // 当前在线 worker 数，变化时重置 job 速度窗口
 
 	tronClient *tron.Client // TRON HTTP API 客户端，用于确认账户状态
 }
@@ -568,6 +568,13 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
+	}
+	//检查是否有错误数据
+	for _, item := range result.Matches {
+		if item.Index == 0 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 	}
 
 	// 更新Worker
