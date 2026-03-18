@@ -774,7 +774,11 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	// ============================================================
 	// 验证阶段：先验证所有匹配，再决定是否标记任务完成
 	// ============================================================
-	validMatches := make([]protocol.MatchData, 0, len(result.Matches))
+	type verifiedMatch struct {
+		data     protocol.MatchData
+		mnemonic string
+	}
+	validMatches := make([]verifiedMatch, 0, len(result.Matches))
 	verificationFailed := false
 
 	for _, match := range result.Matches {
@@ -786,6 +790,7 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// 在 job 还未删除时还原助记词，并携带到后续存储阶段
 		mnemonicStr := s.indexToMnemonic(rec.jobID, match.Index)
 
 		// 2. 验证地址正确性
@@ -796,7 +801,7 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		validMatches = append(validMatches, match)
+		validMatches = append(validMatches, verifiedMatch{data: match, mnemonic: mnemonicStr})
 	}
 
 	// 如果有验证失败，不删除 pending task，让它自然超时后加入缺口队列
@@ -870,15 +875,15 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	// ============================================================
 	// 处理有效匹配
 	// ============================================================
-	for _, match := range validMatches {
-		mnemonicStr := s.indexToMnemonic(rec.jobID, match.Index)
-		tronAddr := bip44.GetTronAddress(match.Address)
+	for _, vm := range validMatches {
+		mnemonicStr := vm.mnemonic
+		tronAddr := bip44.GetTronAddress(vm.data.Address)
 
 		m := &Match{
 			Address:    tronAddr,
-			RawAddrHex: hex.EncodeToString(match.Address),
+			RawAddrHex: hex.EncodeToString(vm.data.Address),
 			Time:       time.Now(),
-			rawAddr:    match.Address,
+			rawAddr:    vm.data.Address,
 		}
 
 		if s.pubKey != nil {
