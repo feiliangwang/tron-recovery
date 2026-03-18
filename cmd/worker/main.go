@@ -105,7 +105,7 @@ func main() {
 
 	// 独立模式：全链路测速
 	if *benchFullN > 0 {
-		runBenchFull(*benchFullN, *useGPU, *workers)
+		runBenchFull(*benchFullN, parseGPUDevices(*gpuDevices, *useGPU), *useGPU || *gpuDevices != "", *workers)
 		return
 	}
 
@@ -498,6 +498,17 @@ func sampleDigest(results []pbkdf2KernelBenchResult) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+func formatGPUDeviceIDs(deviceIDs []int) string {
+	if len(deviceIDs) == 1 {
+		return fmt.Sprintf("GPU(device %d)", deviceIDs[0])
+	}
+	ids := make([]string, len(deviceIDs))
+	for i, deviceID := range deviceIDs {
+		ids[i] = strconv.Itoa(deviceID)
+	}
+	return fmt.Sprintf("GPU x%d (devices %s)", len(deviceIDs), strings.Join(ids, ","))
+}
+
 func runPBKDF2Bench(total int, deviceIDs []int) {
 	if len(deviceIDs) == 0 {
 		log.Fatalf("bench-pbkdf2 需要 GPU，请使用 -gpu 或 -gpu-devices")
@@ -872,18 +883,94 @@ func runVerify(total int, cpuWorkers int) {
 // 全链路测速模式
 // ================================================================
 
-func runBenchFull(total int64, gpu bool, cpuWorkers int) {
+type fullBenchRunner struct {
+	deviceID int
+	startIdx int64
+	endIdx   int64
+	gpu      *compute.GPUComputer
+}
+
+type fullBenchResult struct {
+	deviceID int
+	startIdx int64
+	endIdx   int64
+	elapsed  time.Duration
+}
+
+func splitFullBenchWork(total int64, deviceIDs []int) []fullBenchRunner {
+	if total <= 0 || len(deviceIDs) == 0 {
+		return nil
+	}
+
+	usedDevices := deviceIDs
+	if total < int64(len(usedDevices)) {
+		usedDevices = usedDevices[:int(total)]
+	}
+
+	base := total / int64(len(usedDevices))
+	rem := total % int64(len(usedDevices))
+	start := int64(0)
+	runners := make([]fullBenchRunner, 0, len(usedDevices))
+	for i, deviceID := range usedDevices {
+		count := base
+		if int64(i) < rem {
+			count++
+		}
+		end := start + count
+		if count > 0 {
+			runners = append(runners, fullBenchRunner{
+				deviceID: deviceID,
+				startIdx: start,
+				endIdx:   end,
+			})
+		}
+		start = end
+	}
+	return runners
+}
+
+func prepareFullBenchRunners(total int64, deviceIDs []int) ([]fullBenchRunner, error) {
+	runners := splitFullBenchWork(total, deviceIDs)
+	for i := range runners {
+		gpuComp, err := compute.NewGPUComputer(runners[i].deviceID)
+		if err != nil {
+			for _, runner := range runners {
+				if runner.gpu != nil {
+					_ = runner.gpu.Close()
+				}
+			}
+			return nil, fmt.Errorf("GPU %d 初始化失败: %w", runners[i].deviceID, err)
+		}
+		runners[i].gpu = gpuComp
+	}
+	return runners, nil
+}
+
+func closeFullBenchRunners(runners []fullBenchRunner) {
+	for _, runner := range runners {
+		if runner.gpu != nil {
+			_ = runner.gpu.Close()
+		}
+	}
+}
+
+func runBenchFull(total int64, deviceIDs []int, gpuRequested bool, cpuWorkers int) {
 	knownWords := []string{"abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "abandon", "", "", "", ""}
+	gpu := len(deviceIDs) > 0
+	if gpuRequested && !gpu {
+		log.Fatalf("bench-full 需要 GPU，请使用 -gpu 或 -gpu-devices 并确保 CUDA 可用")
+	}
 
 	var seedComp compute.SeedComputer
 	compName := "CPU"
 	if gpu {
-		g, err := compute.NewGPUComputer(0)
+		g, err := compute.NewGPUComputer(deviceIDs[0])
 		if err != nil {
 			log.Fatalf("GPU初始化失败: %v\n提示: 需要 CUDA 构建且有可用 GPU", err)
 		}
+		defer g.Close()
 		seedComp = g
-		compName = "GPU(device 0)"
+		compName = formatGPUDeviceIDs(deviceIDs)
 	} else {
 		seedComp = compute.NewCPUComputer()
 	}
@@ -905,40 +992,130 @@ func runBenchFull(total int64, gpu bool, cpuWorkers int) {
 		batchSizes = []int64{65536}
 	}
 
-	// 热身
-	{
-		warmupTask := &protocol.CompactTask{TaskID: 0, JobID: 1, StartIdx: 0, EndIdx: 2048}
-		warmupEnum := worker.NewLocalEnumerator(&worker.TaskTemplate{
-			JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
-		})
-		cc := compute.NewCompactComputer(effectiveWorkers, seedComp)
-		cc.SetBatchSize(2048)
-		if gpu {
-			cc.SetEnumWorkers(runtime.NumCPU())
-		}
-		cc.ComputeRange(warmupEnum, warmupTask, nil)
-	}
-
-	task := &protocol.CompactTask{TaskID: 1, JobID: 1, StartIdx: 0, EndIdx: total}
-
 	fmt.Printf("  %-12s  %-10s  %-14s\n", "批次大小", "耗时", "速度(索引/s)")
 	fmt.Printf("  %-12s  %-10s  %-14s\n", "------------", "----------", "--------------")
 
-	for _, bs := range batchSizes {
-		enum := worker.NewLocalEnumerator(&worker.TaskTemplate{
-			JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
-		})
-		cc := compute.NewCompactComputer(effectiveWorkers, seedComp)
-		cc.SetBatchSize(bs)
-		if gpu {
-			cc.SetEnumWorkers(runtime.NumCPU())
+	if !gpu {
+		// 热身
+		{
+			warmupTask := &protocol.CompactTask{TaskID: 0, JobID: 1, StartIdx: 0, EndIdx: 2048}
+			warmupEnum := worker.NewLocalEnumerator(&worker.TaskTemplate{
+				JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
+			})
+			cc := compute.NewCompactComputer(effectiveWorkers, seedComp)
+			cc.SetBatchSize(2048)
+			cc.ComputeRange(warmupEnum, warmupTask, nil)
 		}
 
+		task := &protocol.CompactTask{TaskID: 1, JobID: 1, StartIdx: 0, EndIdx: total}
+		for _, bs := range batchSizes {
+			enum := worker.NewLocalEnumerator(&worker.TaskTemplate{
+				JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
+			})
+			cc := compute.NewCompactComputer(effectiveWorkers, seedComp)
+			cc.SetBatchSize(bs)
+
+			start := time.Now()
+			cc.ComputeRange(enum, task, nil)
+			elapsed := time.Since(start)
+
+			fmt.Printf("  %-12d  %-10s  %.0f\n", bs, fmtDuration(elapsed), float64(total)/elapsed.Seconds())
+		}
+		fmt.Println()
+		return
+	}
+
+	runners, err := prepareFullBenchRunners(total, deviceIDs)
+	if err != nil {
+		log.Fatalf("%v\n提示: 需要 CUDA 构建且有可用 GPU", err)
+	}
+	defer closeFullBenchRunners(runners)
+
+	// 每张卡都单独热身一次，避免第一次 launch 污染正式结果
+	{
+		var wg sync.WaitGroup
+		for _, runner := range runners {
+			wg.Add(1)
+			go func(runner fullBenchRunner) {
+				defer wg.Done()
+				warmupTask := &protocol.CompactTask{
+					TaskID:   int64(runner.deviceID),
+					JobID:    1,
+					StartIdx: runner.startIdx,
+					EndIdx:   runner.startIdx + 2048,
+				}
+				if warmupTask.EndIdx > runner.endIdx {
+					warmupTask.EndIdx = runner.endIdx
+				}
+				if warmupTask.StartIdx >= warmupTask.EndIdx {
+					return
+				}
+				warmupEnum := worker.NewLocalEnumerator(&worker.TaskTemplate{
+					JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
+				})
+				cc := compute.NewCompactComputer(1, runner.gpu)
+				cc.SetBatchSize(2048)
+				cc.SetEnumWorkers(runtime.NumCPU())
+				cc.ComputeRange(warmupEnum, warmupTask, nil)
+			}(runner)
+		}
+		wg.Wait()
+	}
+
+	for _, bs := range batchSizes {
+		results := make([]fullBenchResult, len(runners))
+		errCh := make(chan error, len(runners))
+		var wg sync.WaitGroup
 		start := time.Now()
-		cc.ComputeRange(enum, task, nil)
+		for i, runner := range runners {
+			wg.Add(1)
+			go func(i int, runner fullBenchRunner) {
+				defer wg.Done()
+				enum := worker.NewLocalEnumerator(&worker.TaskTemplate{
+					JobID: 1, Words: append([]string(nil), knownWords...), UnknownPos: []int{8, 9, 10, 11},
+				})
+				cc := compute.NewCompactComputer(1, runner.gpu)
+				cc.SetBatchSize(bs)
+				cc.SetEnumWorkers(runtime.NumCPU())
+				task := &protocol.CompactTask{
+					TaskID:   int64(i + 1),
+					JobID:    1,
+					StartIdx: runner.startIdx,
+					EndIdx:   runner.endIdx,
+				}
+
+				localStart := time.Now()
+				result := cc.ComputeRange(enum, task, nil)
+				elapsed := time.Since(localStart)
+				if result == nil {
+					errCh <- fmt.Errorf("GPU %d bench-full 失败", runner.deviceID)
+					return
+				}
+				results[i] = fullBenchResult{
+					deviceID: runner.deviceID,
+					startIdx: runner.startIdx,
+					endIdx:   runner.endIdx,
+					elapsed:  elapsed,
+				}
+			}(i, runner)
+		}
+		wg.Wait()
 		elapsed := time.Since(start)
+		close(errCh)
+		for err := range errCh {
+			if err != nil {
+				log.Fatalf("%v", err)
+			}
+		}
 
 		fmt.Printf("  %-12d  %-10s  %.0f\n", bs, fmtDuration(elapsed), float64(total)/elapsed.Seconds())
+		fmt.Printf("    设备明细:")
+		for _, result := range results {
+			count := result.endIdx - result.startIdx
+			speed := float64(count) / result.elapsed.Seconds()
+			fmt.Printf(" GPU %d=%s/%.0f", result.deviceID, fmtDuration(result.elapsed), speed)
+		}
+		fmt.Printf("\n")
 	}
 	fmt.Println()
 }
