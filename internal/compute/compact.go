@@ -23,6 +23,15 @@ type rangeEnumerator interface {
 	EnumerateCompute(startIdx, endIdx int64, knownWordIndices []int16, unknownPositions []int8) ([]int64, [][]byte, error)
 }
 
+// streamedRangeEnumerator is optionally implemented by GPUComputer to enable
+// double-buffered CUDA stream pipelining: filter[N+1] overlaps derive[N].
+type streamedRangeEnumerator interface {
+	EnumerateComputeLaunch(streamIdx int, startIdx, endIdx int64,
+		knownWordIndices []int16, unknownPositions []int8, capacity int,
+	) (prevIndices []int64, prevAddresses [][]byte, err error)
+	EnumerateComputeFlush(streamIdx int, capacity int) (indices []int64, addresses [][]byte, err error)
+}
+
 type gpuBloomEnumerator interface {
 	BloomFilterOnGPU() bool
 }
@@ -110,7 +119,73 @@ func (c *CompactComputer) computeRangeGPUNative(
 
 	known, unkPos := ie.TemplateIndices()
 	batchSize := c.batchSize
+	capacity := int(batchSize/7) + 2048
 
+	processMatch := func(idxs []int64, addrs [][]byte) {
+		for i, addr := range addrs {
+			if !gpuBloomActive && bloomFilter != nil && !bloomFilter(addr) {
+				continue
+			}
+			result.Matches = append(result.Matches, protocol.MatchData{
+				Index:   idxs[i],
+				Address: addr,
+			})
+		}
+	}
+
+	// Streaming path: overlap tron_derive[N] with bip39_filter[N+1] via CUDA streams
+	if sre, ok := c.computer.(streamedRangeEnumerator); ok {
+		streamIdx := 0
+		streamOK := true
+
+		for start := task.StartIdx; start < task.EndIdx && streamOK; start += batchSize {
+			end := start + batchSize
+			if end > task.EndIdx {
+				end = task.EndIdx
+			}
+
+			prevIdxs, prevAddrs, err := sre.EnumerateComputeLaunch(streamIdx, start, end, known, unkPos, capacity)
+			if err != nil {
+				// Flush any pending GPU work then fall back to blocking path
+				sre.EnumerateComputeFlush(streamIdx^1, capacity) //nolint:errcheck
+				streamOK = false
+				// Fall back to blocking EnumerateCompute for this and remaining batches
+				for s := start; s < task.EndIdx; s += batchSize {
+					e := s + batchSize
+					if e > task.EndIdx {
+						e = task.EndIdx
+					}
+					idxs, addrs, gerr := re.EnumerateCompute(s, e, known, unkPos)
+					if gerr != nil {
+						eb := c.enumerateBatch(enum, s, e)
+						cpuAddrs := c.computer.Compute(eb.mnemonics)
+						for i, addr := range cpuAddrs {
+							if bloomFilter != nil && !bloomFilter(addr) {
+								continue
+							}
+							result.Matches = append(result.Matches, protocol.MatchData{
+								Index: eb.idxMap[eb.mnemonics[i]], Address: addr,
+							})
+						}
+						continue
+					}
+					processMatch(idxs, addrs)
+				}
+				return result
+			}
+			processMatch(prevIdxs, prevAddrs)
+			streamIdx ^= 1
+		}
+
+		if streamOK {
+			// Flush last pending batch (stream used in the last launch = streamIdx^1)
+			lastIdxs, lastAddrs, _ := sre.EnumerateComputeFlush(streamIdx^1, capacity)
+			processMatch(lastIdxs, lastAddrs)
+		}
+		return result
+	}
+
+	// Non-streaming (blocking) fallback
 	for start := task.StartIdx; start < task.EndIdx; start += batchSize {
 		end := start + batchSize
 		if end > task.EndIdx {
@@ -134,15 +209,7 @@ func (c *CompactComputer) computeRangeGPUNative(
 			continue
 		}
 
-		for i, addr := range addrs {
-			if !gpuBloomActive && bloomFilter != nil && !bloomFilter(addr) {
-				continue
-			}
-			result.Matches = append(result.Matches, protocol.MatchData{
-				Index:   idxs[i],
-				Address: addr,
-			})
-		}
+		processMatch(idxs, addrs)
 	}
 
 	return result

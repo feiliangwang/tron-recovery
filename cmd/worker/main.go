@@ -214,7 +214,7 @@ func runGPUWorkers(ctx context.Context, baseID string, bloomFilter *bloom.Filter
 
 		client := worker.NewCompactClient(*schedulerURL)
 		w := worker.NewCompactWorkerWithComputer(wID, client, 1, gpu)
-		w.SetBatchSize(65536)
+		w.SetBatchSize(524288)
 		w.SetEnumWorkers(cpuPerGPU)
 		w.SetBloomFilter(bloomFilter)
 
@@ -989,7 +989,7 @@ func runBenchFull(total int64, deviceIDs []int, gpuRequested bool, cpuWorkers in
 	}
 	batchSizes := []int64{500, 2048, 8192, 32768, 65536, 131072, 262144}
 	if gpu {
-		batchSizes = []int64{65536}
+		batchSizes = []int64{65536, 131072, 262144, 524288}
 	}
 
 	fmt.Printf("  %-12s  %-10s  %-14s\n", "批次大小", "耗时", "速度(索引/s)")

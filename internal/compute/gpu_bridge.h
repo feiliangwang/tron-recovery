@@ -159,6 +159,42 @@ int gpu_bloom_test_addr(int device_id, const uint8_t *addr20);
 /* Release all persistent GPU enumerate buffers for the specified device (call on shutdown) */
 void gpu_enumerate_cleanup(int device_id);
 
+/*
+ * Streaming pipeline variants of gpu_enumerate_compute.
+ *
+ * gpu_enumerate_launch — launch filter+derive for [start,end) on stream[stream_idx].
+ *   Simultaneously syncs stream[stream_idx^1] and copies its results (previous batch)
+ *   into prev_addrs/prev_indices/prev_count.  The derive for the new batch runs
+ *   asynchronously, overlapping with the next call's filter on the other stream.
+ *
+ * gpu_enumerate_flush — sync stream[stream_idx]'s pending derive and return results.
+ *   Must be called after the loop to collect the last batch.
+ *
+ * Returns 0 on success, -1 on CUDA error.
+ */
+int gpu_enumerate_launch(
+    int            device_id,
+    int            stream_idx,
+    int64_t        start_idx,
+    int64_t        end_idx,
+    const int16_t *known_words,
+    const int8_t  *unknown_pos,
+    int8_t         unknown_count,
+    int            capacity,
+    uint8_t       *prev_addrs,
+    int64_t       *prev_indices,
+    int           *prev_count
+);
+
+int gpu_enumerate_flush(
+    int       device_id,
+    int       stream_idx,
+    int       capacity,
+    uint8_t  *out_addrs,
+    int64_t  *out_indices,
+    int      *out_count
+);
+
 /* Debug: run BIP39 checksum for a single 12-word set on the specified GPU device.
  * Returns stored_cs (low 4 bits of packed bits) and sha0 (SHA256(entropy)[0]).
  * Pass condition: (sha0>>4) == stored_cs. Returns 0 on success, -1 on CUDA error. */

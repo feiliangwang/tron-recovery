@@ -1071,14 +1071,14 @@ func (s *Server) indexToMnemonic(jobID string, idx int64) string {
 
 // handleMatches 匹配结果
 func (s *Server) handleMatches(w http.ResponseWriter, r *http.Request) {
-	s.matchesMu.Lock()
-	views := make([]MatchView, len(s.matches))
-	for i, m := range s.matches {
-		views[i] = matchToView(m)
-	}
-	s.matchesMu.Unlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"matches": views})
+	//s.matchesMu.Lock()
+	//views := make([]MatchView, len(s.matches))
+	//for i, m := range s.matches {
+	//	views[i] = matchToView(m)
+	//}
+	//s.matchesMu.Unlock()
+	//w.Header().Set("Content-Type", "application/json")
+	//json.NewEncoder(w).Encode(map[string]interface{}{"matches": views})
 }
 
 // handleConfirmed 确认成功的地址

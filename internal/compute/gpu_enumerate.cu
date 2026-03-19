@@ -81,7 +81,7 @@ __device__ __noinline__ void en_sha512_compress(uint64_t h[8], const uint8_t blk
     uint64_t W[16];
     for (int i = 0; i < 16; i++) W[i] = ec_load_be64(blk + i * 8);
     uint64_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
-    #pragma unroll 8
+    #pragma unroll
     for (int i = 0; i < 80; i++) {
         if (i >= 16)
             W[i&15] = EN_G1(W[(i-2)&15]) + W[(i-7)&15] + EN_G0(W[(i-15)&15]) + W[i&15];
@@ -149,7 +149,7 @@ __device__ __forceinline__ void sha512_resume_64_words(
     W[14] = 0; W[15] = 1536ULL;
 
     uint64_t a=h0,b=h1,c=h2,d_=h3,e=h4,f=h5,g=h6,hh=h7;
-    #pragma unroll 8
+    #pragma unroll
     for (int i = 0; i < 80; i++) {
         if (i >= 16)
             W[i&15] = EN_G1(W[(i-2)&15]) + EN_G0(W[(i-15)&15]) + W[(i-7)&15] + W[i&15];
@@ -177,7 +177,7 @@ __device__ __forceinline__ void sha512_resume_mnemonic1(
     W[14] = 0; W[15] = 1120ULL;
 
     uint64_t a=h0,b=h1,c=h2,d_=h3,e=h4,f=h5,g=h6,hh=h7;
-    #pragma unroll 8
+    #pragma unroll
     for (int i = 0; i < 80; i++) {
         if (i >= 16)
             W[i&15] = EN_G1(W[(i-2)&15]) + EN_G0(W[(i-15)&15]) + W[(i-7)&15] + W[i&15];
@@ -771,13 +771,23 @@ __global__ void bip39_filter_kernel(
     en_sha256_16(entropy, sha_out);
     if ((sha_out[0] >> 4) != stored_cs) return;
 
-    /* Atomically reserve output slot */
-    int slot = atomicAdd(out_count, 1);
-    if (slot >= capacity) return;
+    /* Warp-ballot prefix-sum compaction: one atomicAdd per warp instead of per thread.
+     * __activemask() gives only threads that passed checksum (others already returned). */
+    {
+        unsigned amask = __activemask();
+        int lane = threadIdx.x & 31;
+        int warp_count = __popc(amask);
+        int leader_lane = __ffs((int)amask) - 1;  /* 0-indexed LSB of amask */
+        int base = 0;
+        if (lane == leader_lane) base = atomicAdd(out_count, warp_count);
+        base = __shfl_sync(amask, base, leader_lane);
+        int slot = base + __popc(amask & ((1u << lane) - 1));
+        if (slot >= capacity) return;
 
-    /* Write compact word indices and original index */
-    for (int i = 0; i < 12; i++) out_wi[slot * 12 + i] = wi[i];
-    out_idx[slot] = idx;
+        /* Write compact word indices and original index */
+        for (int i = 0; i < 12; i++) out_wi[slot * 12 + i] = wi[i];
+        out_idx[slot] = idx;
+    }
 }
 
 /* ================================================================
@@ -852,19 +862,25 @@ __global__ void tron_derive_kernel(
 #define MAX_DEVICES 8
 
 typedef struct {
-    /* Intermediate buffers (kernel 1 → kernel 2) */
-    int16_t *d_wi;
-    int64_t *d_valid_idx;
-    int     *d_valid_count;
-    /* Persistent template buffers */
-    int16_t *d_known;
-    int8_t  *d_unk;
+    /* Per-stream intermediate buffers [0] and [1] (double-buffer) */
+    int16_t *d_wi[2];
+    int64_t *d_valid_idx[2];
+    int     *d_valid_count[2];
+    /* Per-stream output buffers */
+    uint8_t *d_addrs[2];
+    int64_t *d_indices[2];
+    int     *d_out_count[2];
+    /* Per-stream template buffers (avoids races when template is updated) */
+    int16_t *d_known[2];
+    int8_t  *d_unk[2];
     int      unk_capacity;
+    /* CUDA streams */
+    cudaStream_t stream[2];
+    int      streams_created;
+    /* Pending derive state: -1=none pending, 0=no results, >0=valid_count */
+    int      pending_cnt[2];
+    /* Shared state */
     int      stack_limit_set;
-    /* Output buffers (kernel 2 → host) */
-    uint8_t *d_addrs;
-    int64_t *d_indices;
-    int     *d_out_count;   /* bloom-filtered output count */
     int64_t  buf_capacity;
     /* Persistent Bloom filter */
     uint64_t *d_bloom;
@@ -881,29 +897,35 @@ static int ensure_buffers(int device_id, int64_t capacity)
     DeviceState *ds = &g_dev[device_id];
     if (capacity <= ds->buf_capacity) return 0;
     /* Free old buffers */
-    if (ds->d_wi)          { cudaFree(ds->d_wi);          ds->d_wi          = NULL; }
-    if (ds->d_valid_idx)   { cudaFree(ds->d_valid_idx);   ds->d_valid_idx   = NULL; }
-    if (ds->d_valid_count) { cudaFree(ds->d_valid_count); ds->d_valid_count = NULL; }
-    if (ds->d_addrs)       { cudaFree(ds->d_addrs);       ds->d_addrs       = NULL; }
-    if (ds->d_indices)     { cudaFree(ds->d_indices);     ds->d_indices     = NULL; }
-    if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
+    for (int s = 0; s < 2; s++) {
+        if (ds->d_wi[s])          { cudaFree(ds->d_wi[s]);          ds->d_wi[s]          = NULL; }
+        if (ds->d_valid_idx[s])   { cudaFree(ds->d_valid_idx[s]);   ds->d_valid_idx[s]   = NULL; }
+        if (ds->d_valid_count[s]) { cudaFree(ds->d_valid_count[s]); ds->d_valid_count[s] = NULL; }
+        if (ds->d_addrs[s])       { cudaFree(ds->d_addrs[s]);       ds->d_addrs[s]       = NULL; }
+        if (ds->d_indices[s])     { cudaFree(ds->d_indices[s]);     ds->d_indices[s]     = NULL; }
+        if (ds->d_out_count[s])   { cudaFree(ds->d_out_count[s]);   ds->d_out_count[s]   = NULL; }
+    }
     ds->buf_capacity = 0;
 
-    if (cudaMalloc(&ds->d_wi,          (size_t)capacity * 12 * sizeof(int16_t)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&ds->d_valid_idx,   (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
-    if (cudaMalloc(&ds->d_valid_count, sizeof(int))                             != cudaSuccess) goto fail;
-    if (cudaMalloc(&ds->d_addrs,       (size_t)capacity * 20)                   != cudaSuccess) goto fail;
-    if (cudaMalloc(&ds->d_indices,     (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
-    if (cudaMalloc(&ds->d_out_count,   sizeof(int))                             != cudaSuccess) goto fail;
+    for (int s = 0; s < 2; s++) {
+        if (cudaMalloc(&ds->d_wi[s],          (size_t)capacity * 12 * sizeof(int16_t)) != cudaSuccess) goto fail;
+        if (cudaMalloc(&ds->d_valid_idx[s],   (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
+        if (cudaMalloc(&ds->d_valid_count[s], sizeof(int))                              != cudaSuccess) goto fail;
+        if (cudaMalloc(&ds->d_addrs[s],       (size_t)capacity * 20)                   != cudaSuccess) goto fail;
+        if (cudaMalloc(&ds->d_indices[s],     (size_t)capacity * sizeof(int64_t))      != cudaSuccess) goto fail;
+        if (cudaMalloc(&ds->d_out_count[s],   sizeof(int))                              != cudaSuccess) goto fail;
+    }
     ds->buf_capacity = capacity;
     return 0;
 fail:
-    if (ds->d_wi)          { cudaFree(ds->d_wi);          ds->d_wi          = NULL; }
-    if (ds->d_valid_idx)   { cudaFree(ds->d_valid_idx);   ds->d_valid_idx   = NULL; }
-    if (ds->d_valid_count) { cudaFree(ds->d_valid_count); ds->d_valid_count = NULL; }
-    if (ds->d_addrs)       { cudaFree(ds->d_addrs);       ds->d_addrs       = NULL; }
-    if (ds->d_indices)     { cudaFree(ds->d_indices);     ds->d_indices     = NULL; }
-    if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
+    for (int s = 0; s < 2; s++) {
+        if (ds->d_wi[s])          { cudaFree(ds->d_wi[s]);          ds->d_wi[s]          = NULL; }
+        if (ds->d_valid_idx[s])   { cudaFree(ds->d_valid_idx[s]);   ds->d_valid_idx[s]   = NULL; }
+        if (ds->d_valid_count[s]) { cudaFree(ds->d_valid_count[s]); ds->d_valid_count[s] = NULL; }
+        if (ds->d_addrs[s])       { cudaFree(ds->d_addrs[s]);       ds->d_addrs[s]       = NULL; }
+        if (ds->d_indices[s])     { cudaFree(ds->d_indices[s]);     ds->d_indices[s]     = NULL; }
+        if (ds->d_out_count[s])   { cudaFree(ds->d_out_count[s]);   ds->d_out_count[s]   = NULL; }
+    }
     return -1;
 }
 
@@ -911,15 +933,21 @@ static int ensure_template_buffers(int device_id, int8_t unknown_count)
 {
     DeviceState *ds = &g_dev[device_id];
 
-    if (!ds->d_known) {
-        if (cudaMalloc(&ds->d_known, 12 * sizeof(int16_t)) != cudaSuccess) return -1;
+    for (int s = 0; s < 2; s++) {
+        if (!ds->d_known[s]) {
+            if (cudaMalloc(&ds->d_known[s], 12 * sizeof(int16_t)) != cudaSuccess) return -1;
+        }
     }
 
     if ((int)unknown_count > ds->unk_capacity) {
-        if (ds->d_unk) { cudaFree(ds->d_unk); ds->d_unk = NULL; }
+        for (int s = 0; s < 2; s++) {
+            if (ds->d_unk[s]) { cudaFree(ds->d_unk[s]); ds->d_unk[s] = NULL; }
+        }
         ds->unk_capacity = 0;
         if (unknown_count > 0) {
-            if (cudaMalloc(&ds->d_unk, (int)unknown_count * sizeof(int8_t)) != cudaSuccess) return -1;
+            for (int s = 0; s < 2; s++) {
+                if (cudaMalloc(&ds->d_unk[s], (int)unknown_count * sizeof(int8_t)) != cudaSuccess) return -1;
+            }
             ds->unk_capacity = (int)unknown_count;
         }
     }
@@ -927,6 +955,17 @@ static int ensure_template_buffers(int device_id, int8_t unknown_count)
     if (!ds->stack_limit_set) {
         if (cudaDeviceSetLimit(cudaLimitStackSize, 65536) != cudaSuccess) return -1;
         ds->stack_limit_set = 1;
+    }
+
+    if (!ds->streams_created) {
+        if (cudaStreamCreate(&ds->stream[0]) != cudaSuccess) return -1;
+        if (cudaStreamCreate(&ds->stream[1]) != cudaSuccess) {
+            cudaStreamDestroy(ds->stream[0]);
+            return -1;
+        }
+        ds->pending_cnt[0] = -1;
+        ds->pending_cnt[1] = -1;
+        ds->streams_created = 1;
     }
 
     return 0;
@@ -960,59 +999,59 @@ extern "C" int gpu_enumerate_compute(
     if (ensure_buffers(device_id, (int64_t)capacity) != 0) return -1;
     if (ensure_template_buffers(device_id, unknown_count) != 0) return -1;
 
-    if (cudaMemcpy(ds->d_known, known_words, 12 * sizeof(int16_t), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+    if (cudaMemcpy(ds->d_known[0], known_words, 12 * sizeof(int16_t), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
     if (unknown_count > 0) {
-        if (cudaMemcpy(ds->d_unk, unknown_pos, (int)unknown_count * sizeof(int8_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMemcpy(ds->d_unk[0], unknown_pos, (int)unknown_count * sizeof(int8_t), cudaMemcpyHostToDevice) != cudaSuccess) {
             return -1;
         }
     }
-    cudaMemset(ds->d_valid_count, 0, sizeof(int));
+    cudaMemset(ds->d_valid_count[0], 0, sizeof(int));
 
     /* --- Kernel 1: BIP39 filter (256 threads/block) --- */
     {
         int bs = 256, nb = (int)((total + bs - 1) / bs);
-        bip39_filter_kernel<<<nb, bs>>>(
+        bip39_filter_kernel<<<nb, bs, 0, ds->stream[0]>>>(
             start_idx, total,
-            ds->d_known, ds->d_unk, unknown_count,
-            ds->d_wi, ds->d_valid_idx, capacity, ds->d_valid_count);
-        if (cudaDeviceSynchronize() != cudaSuccess) return -1;
+            ds->d_known[0], ds->d_unk[0], unknown_count,
+            ds->d_wi[0], ds->d_valid_idx[0], capacity, ds->d_valid_count[0]);
+        if (cudaStreamSynchronize(ds->stream[0]) != cudaSuccess) return -1;
     }
 
     /* Retrieve valid count */
     {
         int cnt = 0;
-        cudaMemcpy(&cnt, ds->d_valid_count, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&cnt, ds->d_valid_count[0], sizeof(int), cudaMemcpyDeviceToHost);
         if (cnt > capacity) cnt = capacity;
 
         if (cnt > 0) {
-            /* --- Kernel 2: TRON derivation (32 threads/block) --- */
+            /* --- Kernel 2: TRON derivation (64 threads/block) --- */
             int out_cnt;
             if (ds->d_bloom) {
                 /* Bloom mode: output only matching addresses */
-                cudaMemset(ds->d_out_count, 0, sizeof(int));
-                int bs = 32, nb = (cnt + bs - 1) / bs;
-                tron_derive_kernel<<<nb, bs>>>(
-                    ds->d_wi, ds->d_valid_idx, cnt,
-                    ds->d_addrs, ds->d_indices, ds->d_out_count,
+                cudaMemset(ds->d_out_count[0], 0, sizeof(int));
+                int bs = 64, nb = (cnt + bs - 1) / bs;
+                tron_derive_kernel<<<nb, bs, 0, ds->stream[0]>>>(
+                    ds->d_wi[0], ds->d_valid_idx[0], cnt,
+                    ds->d_addrs[0], ds->d_indices[0], ds->d_out_count[0],
                     ds->d_bloom, ds->bloom_m, ds->bloom_k);
-                if (cudaDeviceSynchronize() != cudaSuccess) return -1;
-                cudaMemcpy(&out_cnt, ds->d_out_count, sizeof(int), cudaMemcpyDeviceToHost);
+                if (cudaStreamSynchronize(ds->stream[0]) != cudaSuccess) return -1;
+                cudaMemcpy(&out_cnt, ds->d_out_count[0], sizeof(int), cudaMemcpyDeviceToHost);
                 if (out_cnt > capacity) out_cnt = capacity;
             } else {
                 /* No bloom: write all cnt results */
-                int bs = 32, nb = (cnt + bs - 1) / bs;
-                tron_derive_kernel<<<nb, bs>>>(
-                    ds->d_wi, ds->d_valid_idx, cnt,
-                    ds->d_addrs, ds->d_indices, NULL,
+                int bs = 64, nb = (cnt + bs - 1) / bs;
+                tron_derive_kernel<<<nb, bs, 0, ds->stream[0]>>>(
+                    ds->d_wi[0], ds->d_valid_idx[0], cnt,
+                    ds->d_addrs[0], ds->d_indices[0], NULL,
                     NULL, 0, 0);
-                if (cudaDeviceSynchronize() != cudaSuccess) return -1;
+                if (cudaStreamSynchronize(ds->stream[0]) != cudaSuccess) return -1;
                 out_cnt = cnt;
             }
 
             *out_count = out_cnt;
             if (out_cnt > 0) {
-                cudaMemcpy(out_addrs,   ds->d_addrs,   (size_t)out_cnt * 20,              cudaMemcpyDeviceToHost);
-                cudaMemcpy(out_indices, ds->d_indices, (size_t)out_cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+                cudaMemcpy(out_addrs,   ds->d_addrs[0],   (size_t)out_cnt * 20,              cudaMemcpyDeviceToHost);
+                cudaMemcpy(out_indices, ds->d_indices[0], (size_t)out_cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
             }
         } else {
             *out_count = 0;
@@ -1022,7 +1061,168 @@ extern "C" int gpu_enumerate_compute(
     return 0;
 }
 
-/* Upload bloom filter to GPU persistent memory for the specified device. */
+/* ================================================================
+ * Opt 4 — Double-buffered CUDA stream pipeline.
+ *
+ * gpu_enumerate_launch: launches filter+derive for [start,end) on stream[si].
+ *   Simultaneously collects results from stream[si^1] (the PREVIOUS batch).
+ *   The derive kernel is launched ASYNCHRONOUSLY — it may still be running
+ *   when this function returns, overlapping with the NEXT call's filter.
+ *
+ * gpu_enumerate_flush: syncs the last pending derive and returns its results.
+ *
+ * Calling pattern (Go side):
+ *   streamIdx = 0
+ *   for each batch:
+ *       prevIdxs, prevAddrs = launch(streamIdx, ...)
+ *       process(prevIdxs, prevAddrs)          // results from batch N-1
+ *       streamIdx ^= 1
+ *   lastIdxs, lastAddrs = flush(streamIdx^1)  // results from last batch
+ * ================================================================ */
+extern "C" int gpu_enumerate_launch(
+    int            device_id,
+    int            stream_idx,      /* 0 or 1 */
+    int64_t        start_idx,
+    int64_t        end_idx,
+    const int16_t *known_words,
+    const int8_t  *unknown_pos,
+    int8_t         unknown_count,
+    int            capacity,
+    uint8_t       *prev_addrs,      /* host buffer: results from previous batch */
+    int64_t       *prev_indices,
+    int           *prev_count)
+{
+    if (cudaSetDevice(device_id) != cudaSuccess) return -1;
+    DeviceState *ds = &g_dev[device_id];
+    int si = stream_idx & 1;
+    int pi = si ^ 1;  /* previous stream index */
+
+    /* Step 1: Collect results from the OTHER stream's pending derive */
+    *prev_count = 0;
+    if (ds->pending_cnt[pi] > 0 && prev_addrs) {
+        if (cudaStreamSynchronize(ds->stream[pi]) != cudaSuccess) return -1;
+        int cnt = ds->pending_cnt[pi];
+        if (ds->d_bloom) {
+            int out_cnt = 0;
+            cudaMemcpy(&out_cnt, ds->d_out_count[pi], sizeof(int), cudaMemcpyDeviceToHost);
+            if (out_cnt > capacity) out_cnt = capacity;
+            *prev_count = out_cnt;
+            if (out_cnt > 0) {
+                cudaMemcpy(prev_addrs,   ds->d_addrs[pi],   (size_t)out_cnt * 20,              cudaMemcpyDeviceToHost);
+                cudaMemcpy(prev_indices, ds->d_indices[pi], (size_t)out_cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+            }
+        } else {
+            if (cnt > capacity) cnt = capacity;
+            *prev_count = cnt;
+            if (cnt > 0) {
+                cudaMemcpy(prev_addrs,   ds->d_addrs[pi],   (size_t)cnt * 20,              cudaMemcpyDeviceToHost);
+                cudaMemcpy(prev_indices, ds->d_indices[pi], (size_t)cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+            }
+        }
+    }
+    ds->pending_cnt[pi] = -1;
+
+    /* Step 2: Set up and launch new batch on stream[si] */
+    int64_t total = end_idx - start_idx;
+    if (total <= 0) return 0;
+
+    if (ensure_buffers(device_id, (int64_t)capacity) != 0) return -1;
+    if (ensure_template_buffers(device_id, unknown_count) != 0) return -1;
+
+    /* Template is small (≤36 bytes); use async copy on stream[si] so it is
+     * ordered after any prior operations on that stream. */
+    if (cudaMemcpyAsync(ds->d_known[si], known_words, 12 * sizeof(int16_t),
+                        cudaMemcpyHostToDevice, ds->stream[si]) != cudaSuccess) return -1;
+    if (unknown_count > 0) {
+        if (cudaMemcpyAsync(ds->d_unk[si], unknown_pos, (int)unknown_count * sizeof(int8_t),
+                            cudaMemcpyHostToDevice, ds->stream[si]) != cudaSuccess) return -1;
+    }
+    cudaMemsetAsync(ds->d_valid_count[si], 0, sizeof(int), ds->stream[si]);
+
+    /* Launch filter on stream[si] */
+    {
+        int bs = 256, nb = (int)((total + bs - 1) / bs);
+        bip39_filter_kernel<<<nb, bs, 0, ds->stream[si]>>>(
+            start_idx, total,
+            ds->d_known[si], ds->d_unk[si], unknown_count,
+            ds->d_wi[si], ds->d_valid_idx[si], capacity, ds->d_valid_count[si]);
+        /* Sync only THIS stream's filter so we can read valid_count.
+         * Stream[pi]'s derive (if any) keeps running concurrently. */
+        if (cudaStreamSynchronize(ds->stream[si]) != cudaSuccess) return -1;
+    }
+
+    /* Read valid_count */
+    int cnt = 0;
+    cudaMemcpy(&cnt, ds->d_valid_count[si], sizeof(int), cudaMemcpyDeviceToHost);
+    if (cnt > capacity) cnt = capacity;
+
+    if (cnt > 0) {
+        /* Launch derive on stream[si] — ASYNC, do NOT sync here.
+         * The next call with stream_idx=si will sync it before collecting results. */
+        if (ds->d_bloom) {
+            cudaMemsetAsync(ds->d_out_count[si], 0, sizeof(int), ds->stream[si]);
+            int bs = 64, nb = (cnt + bs - 1) / bs;
+            tron_derive_kernel<<<nb, bs, 0, ds->stream[si]>>>(
+                ds->d_wi[si], ds->d_valid_idx[si], cnt,
+                ds->d_addrs[si], ds->d_indices[si], ds->d_out_count[si],
+                ds->d_bloom, ds->bloom_m, ds->bloom_k);
+        } else {
+            int bs = 64, nb = (cnt + bs - 1) / bs;
+            tron_derive_kernel<<<nb, bs, 0, ds->stream[si]>>>(
+                ds->d_wi[si], ds->d_valid_idx[si], cnt,
+                ds->d_addrs[si], ds->d_indices[si], NULL,
+                NULL, 0, 0);
+        }
+        ds->pending_cnt[si] = cnt;
+    } else {
+        ds->pending_cnt[si] = 0;
+    }
+
+    return 0;
+}
+
+/* Collect results from the last pending batch on stream[stream_idx]. */
+extern "C" int gpu_enumerate_flush(
+    int       device_id,
+    int       stream_idx,
+    int       capacity,
+    uint8_t  *out_addrs,
+    int64_t  *out_indices,
+    int      *out_count)
+{
+    if (cudaSetDevice(device_id) != cudaSuccess) return -1;
+    DeviceState *ds = &g_dev[device_id];
+    int si = stream_idx & 1;
+
+    *out_count = 0;
+    if (ds->pending_cnt[si] <= 0) {
+        ds->pending_cnt[si] = -1;
+        return 0;
+    }
+
+    if (cudaStreamSynchronize(ds->stream[si]) != cudaSuccess) return -1;
+    int cnt = ds->pending_cnt[si];
+
+    if (ds->d_bloom) {
+        int out_cnt = 0;
+        cudaMemcpy(&out_cnt, ds->d_out_count[si], sizeof(int), cudaMemcpyDeviceToHost);
+        if (out_cnt > capacity) out_cnt = capacity;
+        *out_count = out_cnt;
+        if (out_cnt > 0) {
+            cudaMemcpy(out_addrs,   ds->d_addrs[si],   (size_t)out_cnt * 20,              cudaMemcpyDeviceToHost);
+            cudaMemcpy(out_indices, ds->d_indices[si], (size_t)out_cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+        }
+    } else {
+        if (cnt > capacity) cnt = capacity;
+        *out_count = cnt;
+        if (cnt > 0) {
+            cudaMemcpy(out_addrs,   ds->d_addrs[si],   (size_t)cnt * 20,              cudaMemcpyDeviceToHost);
+            cudaMemcpy(out_indices, ds->d_indices[si], (size_t)cnt * sizeof(int64_t), cudaMemcpyDeviceToHost);
+        }
+    }
+    ds->pending_cnt[si] = -1;
+    return 0;
+}
 extern "C" int gpu_bloom_upload(int device_id, const uint64_t *words, uint64_t word_count, uint64_t m, uint32_t k)
 {
     if (cudaSetDevice(device_id) != cudaSuccess) return -1;
@@ -1138,14 +1338,28 @@ extern "C" void gpu_enumerate_cleanup(int device_id)
     gpu_batch_cleanup(device_id);
     gpu_bloom_free(device_id);
     DeviceState *ds = &g_dev[device_id];
-    if (ds->d_wi)          { cudaFree(ds->d_wi);          ds->d_wi          = NULL; }
-    if (ds->d_valid_idx)   { cudaFree(ds->d_valid_idx);   ds->d_valid_idx   = NULL; }
-    if (ds->d_valid_count) { cudaFree(ds->d_valid_count); ds->d_valid_count = NULL; }
-    if (ds->d_known)       { cudaFree(ds->d_known);       ds->d_known       = NULL; }
-    if (ds->d_unk)         { cudaFree(ds->d_unk);         ds->d_unk         = NULL; }
-    if (ds->d_addrs)       { cudaFree(ds->d_addrs);       ds->d_addrs       = NULL; }
-    if (ds->d_indices)     { cudaFree(ds->d_indices);     ds->d_indices     = NULL; }
-    if (ds->d_out_count)   { cudaFree(ds->d_out_count);   ds->d_out_count   = NULL; }
+
+    if (ds->streams_created) {
+        /* Sync both streams before freeing buffers */
+        cudaStreamSynchronize(ds->stream[0]);
+        cudaStreamSynchronize(ds->stream[1]);
+        cudaStreamDestroy(ds->stream[0]);
+        cudaStreamDestroy(ds->stream[1]);
+        ds->streams_created = 0;
+        ds->pending_cnt[0] = -1;
+        ds->pending_cnt[1] = -1;
+    }
+
+    for (int s = 0; s < 2; s++) {
+        if (ds->d_wi[s])          { cudaFree(ds->d_wi[s]);          ds->d_wi[s]          = NULL; }
+        if (ds->d_valid_idx[s])   { cudaFree(ds->d_valid_idx[s]);   ds->d_valid_idx[s]   = NULL; }
+        if (ds->d_valid_count[s]) { cudaFree(ds->d_valid_count[s]); ds->d_valid_count[s] = NULL; }
+        if (ds->d_addrs[s])       { cudaFree(ds->d_addrs[s]);       ds->d_addrs[s]       = NULL; }
+        if (ds->d_indices[s])     { cudaFree(ds->d_indices[s]);     ds->d_indices[s]     = NULL; }
+        if (ds->d_out_count[s])   { cudaFree(ds->d_out_count[s]);   ds->d_out_count[s]   = NULL; }
+        if (ds->d_known[s])       { cudaFree(ds->d_known[s]);       ds->d_known[s]       = NULL; }
+        if (ds->d_unk[s])         { cudaFree(ds->d_unk[s]);         ds->d_unk[s]         = NULL; }
+    }
     ds->unk_capacity = 0;
     ds->stack_limit_set = 0;
     ds->buf_capacity = 0;
