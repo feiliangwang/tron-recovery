@@ -338,8 +338,9 @@
                     <div class="section-title">
                         <h3>🎯 匹配结果</h3>
                         <span id="match-count" style="color: #94a3b8; font-size: 13px;"></span>
+                        <a href="/matches" style="font-size:13px;color:#22d3ee;text-decoration:none;margin-left:12px">查看详情 →</a>
                     </div>
-                    <div id="matches-list"></div>
+                    <div style="padding:12px 0;color:#64748b;font-size:13px">匹配数据已存储至 LevelDB，<a href="/matches" style="color:#22d3ee">点击查看详细记录</a></div>
                 </div>
             </div>
 
@@ -365,9 +366,8 @@
         // 记录各 Worker 历史最高速度，用于绘制相对进度条
         const peakSpeeds = {};
 
-        // 任务/匹配列表稳定排序：记录首次出现顺序
+        // 任务列表稳定排序：记录首次出现顺序
         const jobOrder = [];
-        const matchOrder = [];
 
         // 折叠状态：job-id → true/false（true=展开）
         const jobExpanded = {};
@@ -398,12 +398,14 @@
             indicator.classList.add('show');
 
             try {
-                const [stats, workersData] = await Promise.all([
+                const [stats, workersData, confirmedData] = await Promise.all([
                     fetchAPI('/stats'),
                     fetchAPI('/workers'),
+                    fetchAPI('/confirmed'),
                 ]);
 
                 const workers = workersData.workers || [];
+                const confirmed = confirmedData.confirmed || [];
 
                 // 状态栏
                 const onlineCount = workers.filter(w => isOnline(w)).length;
@@ -420,14 +422,36 @@
                     .reduce((sum, w) => sum + (w.speed || 0), 0);
                 document.getElementById('stat-speed').textContent = formatNum(totalSpeed);
 
+                // 匹配计数显示
+                const encBadge = encryptedMode
+                    ? ' <span class="match-confirm-badge badge-encrypted">🔒 加密存储</span>'
+                    : '';
+                document.getElementById('match-count').innerHTML = `${stats.matches || 0} 个${encBadge}`;
+
                 // 刷新任务
                 await refreshJobs();
 
-                // 刷新 Workers（传入总速度供进度条参考）
+                // 刷新 Workers
                 renderWorkers(workers);
 
-                // 刷新匹配
-                await refreshMatches();
+                // 已激活账户
+                const confirmedPanel = document.getElementById('confirmed-panel');
+                const confirmedList  = document.getElementById('confirmed-list');
+                if (confirmed.length > 0) {
+                    confirmedPanel.style.display = '';
+                    document.getElementById('confirmed-count').textContent = `${confirmed.length} 个`;
+                    confirmedList.innerHTML = confirmed.map(m => {
+                        const ct = m.time ? new Date(m.time).toLocaleString() : '';
+                        return `
+                            <div class="confirmed-item">
+                                <div class="match-address">🏆 ${m.address}</div>
+                                ${ct ? `<div class="match-create-time">发现时间: ${ct}</div>` : ''}
+                                ${renderMnemonicField(m)}
+                            </div>`;
+                    }).join('');
+                } else {
+                    confirmedPanel.style.display = 'none';
+                }
 
             } finally {
                 setTimeout(() => indicator.classList.remove('show'), 300);
@@ -599,76 +623,6 @@
             });
         }
 
-        async function refreshMatches() {
-            const [matchesData, confirmedData] = await Promise.all([
-                fetchAPI('/matches'),
-                fetchAPI('/confirmed'),
-            ]);
-            const matches = matchesData.matches || [];
-            const confirmed = confirmedData.confirmed || [];
-
-            // 稳定排序：按首次出现顺序，新匹配追加
-            const matchMap = {};
-            matches.forEach(m => matchMap[m.address] = m);
-            matches.forEach(m => { if (!matchOrder.includes(m.address)) matchOrder.push(m.address); });
-            const stableMatches = matchOrder.filter(a => matchMap[a]).map(a => matchMap[a]);
-
-            // 全部（取最新20条，但顺序固定）
-            const allRecent = stableMatches.slice(-20).reverse();
-
-            // 统计
-            const encBadge = encryptedMode
-                ? ' <span class="match-confirm-badge badge-encrypted">🔒 加密存储</span>'
-                : '';
-            document.getElementById('match-count').innerHTML = `${matches.length} 个${encBadge}`;
-
-            // --- 已激活账户栏 ---
-            const confirmedPanel = document.getElementById('confirmed-panel');
-            const confirmedList  = document.getElementById('confirmed-list');
-            if (confirmed.length > 0) {
-                confirmedPanel.style.display = '';
-                document.getElementById('confirmed-count').textContent = `${confirmed.length} 个`;
-                confirmedList.innerHTML = confirmed.map(m => {
-                    const ct = m.time ? new Date(m.time).toLocaleString() : '';
-                    return `
-                        <div class="confirmed-item">
-                            <div class="match-address">🏆 ${m.address}</div>
-                            ${ct ? `<div class="match-create-time">发现时间: ${ct}</div>` : ''}
-                            ${renderMnemonicField(m)}
-                        </div>`;
-                }).join('');
-            } else {
-                confirmedPanel.style.display = 'none';
-            }
-
-            // --- 全部匹配列表 ---
-            const list = document.getElementById('matches-list');
-            if (matches.length === 0) {
-                list.innerHTML = '<div class="empty-state">暂无匹配</div>';
-                return;
-            }
-
-            // 构建已确认地址集合用于快速查询
-            const confirmedSet = new Set(confirmed.map(m => m.address));
-
-            list.innerHTML = allRecent.map(m => {
-                let badge, badgeClass;
-                if (confirmedSet.has(m.address)) {
-                    badge = '✅ 已激活'; badgeClass = 'badge-active';
-                } else if (m.exists === false) {
-                    badge = '⬜ 未激活'; badgeClass = 'badge-inactive';
-                } else {
-                    badge = '⏳ 待确认'; badgeClass = 'badge-pending';
-                }
-                return `
-                    <div class="match-item">
-                        <div><span class="match-confirm-badge ${badgeClass}">${badge}</span></div>
-                        <div class="match-address">${m.address}</div>
-                        ${renderMnemonicField(m)}
-                    </div>`;
-            }).join('');
-        }
-
         async function createJob() {
             const name = document.getElementById('job-name').value;
             const mnemonic = document.getElementById('mnemonic').value;
@@ -734,7 +688,7 @@
 
         // 启动自动刷新
         refresh();
-        setInterval(refresh, 2000);
+        setInterval(refresh, 30000);
     </script>
 </body>
 </html>

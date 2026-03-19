@@ -400,3 +400,66 @@ func (tm *TaskManager) saveAutoID() {
 		log.Printf("[TaskManager] 保存 autoID 失败: %v", err)
 	}
 }
+
+// ============================================================
+// Match 记录管理（存储在 LevelDB，key=match:{address}）
+// ============================================================
+
+// MatchRecord 匹配记录
+type MatchRecord struct {
+	JobID             string    `json:"job_id"`
+	Mnemonic          string    `json:"mnemonic,omitempty"`
+	EncryptedMnemonic string    `json:"encrypted_mnemonic,omitempty"`
+	Address           string    `json:"address"`
+	RawAddrHex        string    `json:"raw_addr_hex"`
+	Time              time.Time `json:"time"`
+	Exists            bool      `json:"exists"`
+}
+
+func matchKey(address string) []byte {
+	return []byte("match:" + address)
+}
+
+// SaveMatch 保存匹配记录（以 address 为唯一键，幂等）
+func (tm *TaskManager) SaveMatch(r *MatchRecord) error {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return tm.db.Put(matchKey(r.Address), data, nil)
+}
+
+// UpdateMatchExists 更新匹配记录的账户存在状态
+func (tm *TaskManager) UpdateMatchExists(address string, exists bool) error {
+	key := matchKey(address)
+	data, err := tm.db.Get(key, nil)
+	if err != nil {
+		return err
+	}
+	var r MatchRecord
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	r.Exists = exists
+	updated, err := json.Marshal(&r)
+	if err != nil {
+		return err
+	}
+	return tm.db.Put(key, updated, nil)
+}
+
+// LoadAllMatches 从 LevelDB 加载所有匹配记录
+func (tm *TaskManager) LoadAllMatches() ([]*MatchRecord, error) {
+	prefix := []byte("match:")
+	var records []*MatchRecord
+	iter := tm.db.NewIterator(util.BytesPrefix(prefix), nil)
+	defer iter.Release()
+	for iter.Next() {
+		var r MatchRecord
+		if err := json.Unmarshal(iter.Value(), &r); err != nil {
+			continue
+		}
+		records = append(records, &r)
+	}
+	return records, iter.Error()
+}

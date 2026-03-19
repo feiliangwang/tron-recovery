@@ -75,7 +75,6 @@ type jobSpeedEntry struct {
 // Server 服务器
 type Server struct {
 	taskManager   *scheduler.TaskManager
-	matchesFile   string         // 匹配结果持久化文件路径
 	confirmedFile string         // 确认成功的地址持久化文件路径
 	pubKey        *rsa.PublicKey // RSA 公钥，非 nil 时启用助记词加密；服务端无私钥，无法解密
 
@@ -267,7 +266,6 @@ func main() {
 	// 创建服务器
 	server := &Server{
 		taskManager:   tm,
-		matchesFile:   filepath.Join(*dataDir, "matches.json"),
 		confirmedFile: filepath.Join(*dataDir, "confirmed.json"),
 		pubKey:        pubKey,
 		sessions:      make(map[string]time.Time),
@@ -307,7 +305,7 @@ func main() {
 	server.loadConfirmed()
 
 	// 加载持久化的匹配结果（会将已确认的同步到 confirmed 列表）
-	server.loadMatches()
+	server.loadMatchesFromDB()
 
 	// Worker清理
 	go server.cleanWorkers()
@@ -322,6 +320,7 @@ func main() {
 	http.HandleFunc("/api/template", server.handleTemplate)
 	// Web UI / Admin 路由需要认证
 	http.HandleFunc("/", server.withAuth(server.handleIndex))
+	http.HandleFunc("/matches", server.withAuth(server.handleMatchesPage))
 	http.HandleFunc("/api/jobs", server.withAuth(server.handleJobs))
 	http.HandleFunc("/api/jobs/", server.withAuth(server.handleJobAction))
 	http.HandleFunc("/api/matches", server.withAuth(server.handleMatches))
@@ -342,6 +341,13 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data, _ := staticFS.ReadFile("static/index.html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(data)
+}
+
+// handleMatchesPage 匹配记录详情页
+func (s *Server) handleMatchesPage(w http.ResponseWriter, r *http.Request) {
+	data, _ := staticFS.ReadFile("static/matches.html")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(data)
 }
@@ -1005,6 +1011,7 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 		tronAddr := bip44.GetTronAddress(vm.data.Address)
 
 		m := &Match{
+			JobID:      rec.jobID,
 			Address:    tronAddr,
 			RawAddrHex: hex.EncodeToString(vm.data.Address),
 			Time:       time.Now(),
@@ -1023,9 +1030,21 @@ func (s *Server) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 			m.Mnemonic = mnemonicStr
 		}
 
+		// 保存到 LevelDB
+		if err := s.taskManager.SaveMatch(&scheduler.MatchRecord{
+			JobID:             m.JobID,
+			Mnemonic:          m.Mnemonic,
+			EncryptedMnemonic: m.EncryptedMnemonic,
+			Address:           m.Address,
+			RawAddrHex:        m.RawAddrHex,
+			Time:              m.Time,
+			Exists:            m.Exists,
+		}); err != nil {
+			log.Printf("[Matches] 保存到 LevelDB 失败: %v", err)
+		}
+
 		s.matchesMu.Lock()
 		s.matches = append(s.matches, m)
-		s.saveMatchesLocked()
 		s.matchesMu.Unlock()
 
 		log.Printf("========== 匹配 ✅已验证 ==========")
@@ -1069,16 +1088,38 @@ func (s *Server) indexToMnemonic(jobID string, idx int64) string {
 	return strings.Join(words, " ")
 }
 
-// handleMatches 匹配结果
+// handleMatches 匹配结果（分页，最新在前）
 func (s *Server) handleMatches(w http.ResponseWriter, r *http.Request) {
-	//s.matchesMu.Lock()
-	//views := make([]MatchView, len(s.matches))
-	//for i, m := range s.matches {
-	//	views[i] = matchToView(m)
-	//}
-	//s.matchesMu.Unlock()
-	//w.Header().Set("Content-Type", "application/json")
-	//json.NewEncoder(w).Encode(map[string]interface{}{"matches": views})
+	page := 0
+	fmt.Sscanf(r.URL.Query().Get("page"), "%d", &page)
+	if page < 0 {
+		page = 0
+	}
+	const pageSize = 50
+
+	s.matchesMu.Lock()
+	total := len(s.matches)
+	start := page * pageSize
+	var views []MatchView
+	if start < total {
+		end := start + pageSize
+		if end > total {
+			end = total
+		}
+		// 倒序返回（最新在前）
+		for i := total - 1 - start; i >= total-end; i-- {
+			views = append(views, matchToView(s.matches[i]))
+		}
+	}
+	s.matchesMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+		"matches":   views,
+	})
 }
 
 // handleConfirmed 确认成功的地址
@@ -1357,64 +1398,43 @@ func (s *Server) resetJobSpeedWindowsLocked() {
 	}
 }
 
-// saveMatchesLocked 将 matches 写入磁盘（调用前须持有 matchesMu）
-func (s *Server) saveMatchesLocked() {
-	if s.matchesFile == "" {
-		return
-	}
-	data, err := json.MarshalIndent(s.matches, "", "  ")
+// loadMatchesFromDB 从 LevelDB 加载 matches，并还原 rawAddr 及同步 confirmed
+func (s *Server) loadMatchesFromDB() {
+	records, err := s.taskManager.LoadAllMatches()
 	if err != nil {
-		log.Printf("[Matches] 序列化失败: %v", err)
-		return
-	}
-	if err := os.WriteFile(s.matchesFile, data, 0644); err != nil {
-		log.Printf("[Matches] 写入失败: %v", err)
-	}
-}
-
-// loadMatches 从磁盘恢复 matches，并还原 rawAddr
-func (s *Server) loadMatches() {
-	if s.matchesFile == "" {
-		return
-	}
-	data, err := os.ReadFile(s.matchesFile)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[Matches] 读取失败: %v", err)
-		}
+		log.Printf("[Matches] 从 LevelDB 加载失败: %v", err)
 		return
 	}
 
 	var matches []*Match
-	if err := json.Unmarshal(data, &matches); err != nil {
-		log.Printf("[Matches] 解析失败: %v", err)
-		return
-	}
-
-	// 从 RawAddrHex 恢复 rawAddr
-	for _, m := range matches {
-		if m.RawAddrHex != "" {
-			if b, err := hex.DecodeString(m.RawAddrHex); err == nil {
+	var confirmedFromMatches []*Match
+	for _, r := range records {
+		m := &Match{
+			JobID:             r.JobID,
+			Mnemonic:          r.Mnemonic,
+			EncryptedMnemonic: r.EncryptedMnemonic,
+			Address:           r.Address,
+			RawAddrHex:        r.RawAddrHex,
+			Time:              r.Time,
+			Exists:            r.Exists,
+		}
+		if r.RawAddrHex != "" {
+			if b, err := hex.DecodeString(r.RawAddrHex); err == nil {
 				m.rawAddr = b
 			}
+		}
+		matches = append(matches, m)
+		if r.Exists {
+			confirmedFromMatches = append(confirmedFromMatches, m)
 		}
 	}
 
 	s.matchesMu.Lock()
 	s.matches = matches
-	// 将已确认的匹配添加到 confirmed 列表（在 confirmedMu 中）
-	var confirmedFromMatches []*Match
-	for _, m := range matches {
-		if m.Exists {
-			confirmedFromMatches = append(confirmedFromMatches, m)
-		}
-	}
 	s.matchesMu.Unlock()
 
-	// 将已确认的匹配同步到 confirmed 列表
 	if len(confirmedFromMatches) > 0 {
 		s.confirmedMu.Lock()
-		// 建立地址集合，避免重复
 		existingAddrs := make(map[string]bool)
 		for _, c := range s.confirmed {
 			existingAddrs[c.Address] = true
@@ -1429,7 +1449,7 @@ func (s *Server) loadMatches() {
 		s.confirmedMu.Unlock()
 	}
 
-	log.Printf("[Matches] 已加载 %d 条匹配记录", len(matches))
+	log.Printf("[Matches] 已从 LevelDB 加载 %d 条匹配记录", len(matches))
 }
 
 // loadConfirmed 从磁盘恢复已确认成功的地址
@@ -1519,9 +1539,12 @@ func (s *Server) confirmMatch(m *Match) {
 
 	exists := s.accountDb.IsExist(m.rawAddr)
 
+	if err := s.taskManager.UpdateMatchExists(m.Address, exists); err != nil {
+		log.Printf("[Matches] 更新 LevelDB 失败: %v", err)
+	}
+
 	s.matchesMu.Lock()
 	m.Exists = exists
-	s.saveMatchesLocked()
 	s.matchesMu.Unlock()
 
 	if exists {
